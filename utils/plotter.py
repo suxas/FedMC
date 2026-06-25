@@ -45,4 +45,5 @@ def plot_accuracy_comparison(results_dict, save_path="data/results/accuracy_comp
 
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     print(f"\n[Plotter] Figure successfully generated at: {save_path}")
+    plt.show()  # [新增] 执行完成显示结果比较图
     plt.close()

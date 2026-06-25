@@ -1,37 +1,67 @@
 import numpy as np
+import torch
+import torch.nn as nn
+from nodes.models import FeatureExtractor, ClassifierHead
 
 
 class ClientUE:
-    def __init__(self, client_id, config):
+    def __init__(self, client_id, config, train_loader, num_classes):
         self.id = client_id
         self.config = config
+        self.device = config['device']
+        self.train_loader = train_loader
+
+        # 模型实例化
+        in_channels = 3 if config['dataset'] == "CIFAR10" else 1
+        feature_dim = 32 * 8 * 8 if config['dataset'] == "CIFAR10" else 32 * 7 * 7
+
+        self.feature_extractor = FeatureExtractor(in_channels).to(self.device)
+        # 个性化分类器头，永远留在本地
+        self.classifier = ClassifierHead(feature_dim, num_classes).to(self.device)
+
+        self.criterion = nn.CrossEntropyLoss()
+
         self.channel_quality = 1.0
         self.refresh_state()
 
     def refresh_state(self):
-        """
-        每轮刷新信道状态与系统算力状态。
-        结合 config 中的 straggler_rate 模拟当前轮次该设备是否陷入算力或信道瓶颈。
-        """
         self.channel_quality = np.random.uniform(0.1, 1.0)
-        # 依据设定的掉队率，随机决定该设备本轮是否处于“劣势状态”
         self.is_straggler_state = (np.random.rand() < self.config['straggler_rate'])
 
-    def local_train(self):
-        """
-        模拟本地特征层梯度的训练，体现 local_lr 和 local_epochs 的作用。
-        """
-        epochs = self.config.get('local_epochs', 1)
-        lr = self.config.get('local_lr', 0.01)
-        grad_dim = self.config.get('grad_dim', 500)
+    def set_global_features(self, global_state_dict):
+        self.feature_extractor.load_state_dict(global_state_dict)
 
-        accumulated_grad = np.zeros(grad_dim)
+    def local_train(self, global_state_dict):
+        """执行本地 SGD 训练，返回特征提取层的伪梯度 (Pseudo-gradient)"""
+        self.set_global_features(global_state_dict)
 
-        # 模拟执行 local_epochs 轮本地 SGD
-        for epoch in range(epochs):
-            # 加入信道偏移模拟 Non-IID 数据带来的梯度差异
-            step_gradient = np.random.normal(loc=self.channel_quality, scale=0.1, size=grad_dim)
-            # 使用本地学习率累加梯度
-            accumulated_grad += step_gradient * lr
+        # 记录初始权重，用于计算增量
+        initial_weights = [p.data.clone() for p in self.feature_extractor.parameters()]
 
-        return accumulated_grad
+        optimizer = torch.optim.SGD(
+            list(self.feature_extractor.parameters()) + list(self.classifier.parameters()),
+            lr=self.config['local_lr'], momentum=0.5
+        )
+
+        self.feature_extractor.train()
+        self.classifier.train()
+
+        for epoch in range(self.config['local_epochs']):
+            for images, labels in self.train_loader:
+                if len(images) == 0: continue
+                images, labels = images.to(self.device), labels.to(self.device)
+
+                optimizer.zero_grad()
+                features = self.feature_extractor(images)
+                outputs = self.classifier(features)
+                loss = self.criterion(outputs, labels)
+                loss.backward()
+                optimizer.step()
+
+        # 计算并展平特征提取层的更新量 (1D Numpy Array)
+        flat_pseudo_grad = []
+        for init_w, curr_w in zip(initial_weights, self.feature_extractor.parameters()):
+            diff = (init_w - curr_w.data).cpu().numpy().flatten()
+            flat_pseudo_grad.append(diff)
+
+        return np.concatenate(flat_pseudo_grad)
