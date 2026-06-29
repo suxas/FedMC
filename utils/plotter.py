@@ -3,7 +3,7 @@ import os
 
 
 def setup_plot_style(font_size=16):
-    """全局配置 matplotlib 为 IEEE 论文图表标准"""
+    """IEEE 论文图表风格配置"""
     plt.rcParams.update({
         'font.family': 'serif',
         'font.serif': ['Times New Roman'],
@@ -28,7 +28,6 @@ def plot_accuracy_comparison(results_dict, save_path="data/results/accuracy_comp
     lines = ['-', '--', '-.', ':']
 
     for i, (algo_name, data) in enumerate(results_dict.items()):
-        # 降采样标记点，避免图表过于密集
         markevery = max(1, len(data['rounds']) // 10)
         ax.plot(data['rounds'], data['accuracy'],
                 label=algo_name,
@@ -44,6 +43,9 @@ def plot_accuracy_comparison(results_dict, save_path="data/results/accuracy_comp
     ax.grid(True, linestyle='--', alpha=0.6)
 
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    print(f"\n[Plotter] Figure successfully generated at: {save_path}")
-    plt.show()  # [新增] 执行完成显示结果比较图
+    png_path = save_path.replace('.pdf', '.png')
+    plt.savefig(png_path, dpi=300, bbox_inches='tight')
+    print(f"\n[Plotter] Figure saved to: {save_path}")
+    print(f"[Plotter] Figure saved to: {png_path}")
+    plt.show()
     plt.close()

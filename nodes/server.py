@@ -6,8 +6,7 @@ class CloudServer:
         self.config = config
 
     def global_aggregate(self, edge_gradients):
-        """MBS 最基础的全局聚合行为 (加权平均)"""
-        # 过滤掉完全无效的边缘梯度
+        """对各边缘服务器的梯度做简单平均聚合"""
         valid_grads = [g for g in edge_gradients if g is not None]
         if not valid_grads:
             return np.zeros(self.config.get('grad_dim', 500))

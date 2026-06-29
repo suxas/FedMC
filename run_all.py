@@ -3,23 +3,25 @@ from utils.logger import ExperimentLogger
 from utils.plotter import plot_accuracy_comparison
 from main_fedavg import run_fedavg
 from main import run_proposed
+from main_salf import run_salf
 
 
 def execute_experiment(algo_name, config, run_func):
+    """检查缓存后执行实验，结果自动按 config hash 持久化"""
     logger = ExperimentLogger(config)
-    cached_data = logger.check_existing_data()
+    #cached_data = logger.check_existing_data()
 
-    if cached_data:
-        print(f"[*] Skipping computation for {algo_name}. Using cached data.")
-        return cached_data
-    else:
-        acc_list = run_func(config)
-        data_to_save = {
-            "rounds": list(range(config['global_rounds'])),
-            "accuracy": acc_list
-        }
-        logger.save_data(data_to_save)
-        return data_to_save
+    #if cached_data:
+    #    print(f"[*] Skipping computation for {algo_name}. Using cached data.")
+    #    return cached_data
+
+    acc_list = run_func(config)
+    data_to_save = {
+        "rounds": list(range(config['global_rounds'])),
+        "accuracy": acc_list
+    }
+    logger.save_data(data_to_save)
+    return data_to_save
 
 
 if __name__ == "__main__":
@@ -38,6 +40,12 @@ if __name__ == "__main__":
     cfg_proposed['algo_type'] = "Proposed_LRMC_NOMA_RealTrain"
     results_db["Proposed (NOMA + Sparse + LRMC)"] = execute_experiment(
         "Proposed", cfg_proposed, run_proposed
+    )
+
+    cfg_salf = base_cfg.copy()
+    cfg_salf['algo_type'] = "SALF_LayerWise_RealTrain"
+    results_db["SALF (Layer-Wise)"] = execute_experiment(
+        "SALF", cfg_salf, run_salf
     )
 
     plot_accuracy_comparison(results_db)
