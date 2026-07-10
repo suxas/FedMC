@@ -1,51 +1,62 @@
+import os
+import json
 from config import get_base_config
-from utils.logger import ExperimentLogger
-from utils.plotter import plot_accuracy_comparison
-from main_fedavg import run_fedavg
 from main import run_proposed
+from main_fedavg import run_fedavg
 from main_salf import run_salf
+from utils.logger import ExperimentLogger
+from utils.plotter import plot_results
 
 
-def execute_experiment(algo_name, config, run_func):
-    """检查缓存后执行实验，结果自动按 config hash 持久化"""
+def execute_experiment(algo_name, config, run_func, history_path=None):
+
+    config['algo_name'] = algo_name
     logger = ExperimentLogger(config)
-    #cached_data = logger.check_existing_data()
 
-    #if cached_data:
-    #    print(f"[*] Skipping computation for {algo_name}. Using cached data.")
-    #    return cached_data
+    if history_path and os.path.exists(history_path):
+        print(f"[{algo_name}] 强制加载指定历史数据: {history_path}")
+        with open(history_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    elif history_path:
+        print(f"[{algo_name}] 警告: 指定的历史文件未找到 ({history_path})，将降级处理...")
 
-    acc_list = run_func(config)
-    data_to_save = {
+    if config.get('use_cache', False):
+        cached_data = logger.check_existing_data()
+        if cached_data:
+            print(f"[{algo_name}] 发现哈希匹配的缓存数据，跳过计算。")
+            return cached_data
+
+    print(f"\n--- 开始执行算法: {algo_name} ---")
+    metrics = run_func(config)
+
+    data = {
         "rounds": list(range(config['global_rounds'])),
-        "accuracy": acc_list
+        "accuracy": metrics["accuracy"],
+        "loss": metrics["loss"]
     }
-    logger.save_data(data_to_save)
-    return data_to_save
+    logger.save_data(data)
+    return data
 
 
 if __name__ == "__main__":
+    base_config = get_base_config()
     results_db = {}
-    base_cfg = get_base_config()
 
-    print(f"\n=== Hierarchical FL Framework (Device: {base_cfg['device']}) ===")
-
-    cfg_fedavg = base_cfg.copy()
-    cfg_fedavg['algo_type'] = "Standard_FedAvg_RealTrain"
+    cfg_fedavg = base_config.copy()
     results_db["Standard FedAvg"] = execute_experiment(
-        "FedAvg", cfg_fedavg, run_fedavg
+        "FedAvg", cfg_fedavg, run_fedavg,
+        #history_path="data/results/FedAvg/30_20260708_150805.json"
     )
 
-    cfg_proposed = base_cfg.copy()
-    cfg_proposed['algo_type'] = "Proposed_LRMC_NOMA_RealTrain"
-    results_db["Proposed (NOMA + Sparse + LRMC)"] = execute_experiment(
-        "Proposed", cfg_proposed, run_proposed
-    )
-
-    cfg_salf = base_cfg.copy()
-    cfg_salf['algo_type'] = "SALF_LayerWise_RealTrain"
+    cfg_salf = base_config.copy()
     results_db["SALF (Layer-Wise)"] = execute_experiment(
-        "SALF", cfg_salf, run_salf
+        "SALF", cfg_salf, run_salf,
     )
 
-    plot_accuracy_comparison(results_db)
+    cfg_proposed = base_config.copy()
+    results_db["Proposed (Multi-modal LRMC)"] = execute_experiment(
+        "Proposed_LRMC", cfg_proposed, run_proposed,
+        #history_path="data/results/Proposed_LRMC/30_20260708_153213.json"
+    )
+
+    plot_results(results_db)

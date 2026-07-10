@@ -14,17 +14,14 @@ def run_fedavg(config):
     in_channels = 3 if config['dataset'] == "CIFAR10" else 1
     global_model = FeatureExtractor(in_channels).to(config['device'])
     global_state_dict = global_model.state_dict()
-    config['grad_dim'] = sum(p.numel() for p in global_state_dict.values())
 
     server = CloudServer(config)
     sbs_list = [EdgeSBS(i, config) for i in range(config['num_sbs'])]
-    clients = [
-        ClientUE(i, config, train_loaders[i], num_classes)
-        for i in range(config['num_sbs'] * config['clients_per_sbs'])
-    ]
-    accuracy_history = []
+    clients = [ClientUE(i, config, train_loaders[i], num_classes) for i in
+               range(config['num_sbs'] * config['clients_per_sbs'])]
 
-    pbar = tqdm(range(config['global_rounds']), colour='green', desc="[FedAvg]")
+    accuracy_history, loss_history = [], []
+    pbar = tqdm(range(config['global_rounds']), colour='green', desc="[Standard FedAvg]")
 
     for round_idx in pbar:
         for c in clients:
@@ -34,12 +31,10 @@ def run_fedavg(config):
         for sbs in sbs_list:
             start = sbs.id * config['clients_per_sbs']
             end = start + config['clients_per_sbs']
-            cluster_clients = clients[start:end]
             received_grads = []
 
-            for client in cluster_clients:
-                # OMA 模式：掉队者或信道不达标直接丢弃
-                if client.is_straggler_state or client.channel_quality < config['oma_threshold']:
+            for client in clients[start:end]:
+                if client.is_straggler_state or client.channel_quality < config['truncation_threshold']:
                     continue
                 received_grads.append(client.local_train(global_state_dict))
 
@@ -48,20 +43,16 @@ def run_fedavg(config):
 
         global_update_1d = server.global_aggregate(edge_grads)
 
-        # 将 1D 更新向量还原为权重字典并更新
         idx = 0
         for name, param in global_state_dict.items():
             size = param.numel()
-            update_tensor = torch.tensor(
-                global_update_1d[idx:idx + size]
-            ).reshape(param.shape).to(config['device'])
+            update_tensor = torch.tensor(global_update_1d[idx:idx + size]).reshape(param.shape).to(config['device'])
             global_state_dict[name] -= update_tensor
             idx += size
 
-        mean_acc, mean_loss = evaluate_global_model(
-            clients, global_state_dict, test_loader, config['device']
-        )
+        mean_acc, mean_loss = evaluate_global_model(clients, global_state_dict, test_loader, config['device'])
         accuracy_history.append(mean_acc)
+        loss_history.append(mean_loss)
         pbar.set_postfix(Acc=f"{mean_acc:.2f}%", Loss=f"{mean_loss:.4f}")
 
-    return accuracy_history
+    return {"accuracy": accuracy_history, "loss": loss_history}
