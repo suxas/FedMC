@@ -2,35 +2,34 @@ import torch
 
 
 def get_base_config():
-    """全局配置：多模态比例、网络层数、异构分布和截断门限等环境参数"""
+    """全局配置：无人机联邦学习场景参数"""
     return {
-        "dataset": "CIFAR10",               # 数据集选择："FashionMNIST", "CIFAR10", "SYSU-MM01"
-        "input_size": 32,                   # 输入图像尺寸（FashionMNIST=28, CIFAR10=32, SYSU-MM01=64）
-        "global_rounds": 300,               # 通信轮数（增加到300观察长期收敛）
-        "num_sbs": 3,                       # 小基站数量
-        "clients_per_sbs": 10,              # 每个SBS的客户端数
-
-        "modality_rgb_ratio": 0.5,          # RGB模态比例
+        "dataset": "MNIST",                  # 数据集选择："MNIST", "CIFAR10", "CIFAR100"
+        "input_size": 32,                    # 输入图像尺寸（统一32×32）
+        "global_rounds": 50,                # 全局通信轮数
+        "num_sbs": 3,                        # 小基站（SBS）数量
+        "clients_per_sbs": 10,               # 每个SBS管理的无人机（UAV）数量
+        "client_fraction": 1.0,              # 每轮随机选择的客户端比例（FedAvg原版参数C）
 
         "device": "cuda" if torch.cuda.is_available() else "cpu",
         "batch_size": 32,
-        "local_lr": 0.01,                   # 本地学习率
-        "local_epochs": 3,                  # 本地训练轮数（增加本地漂移量）
+        "local_lr": 0.01,                    # 本地学习率
+        "local_epochs": 3,                   # 本地训练轮数
 
-        # Non-IID参数（α越大越均匀）
-        "alpha_inter": 0.3,                 # SBS间异构程度
-        "alpha_intra": 0.3,                 # SBS内异构程度
+        # 数据分布参数
+        "alpha_intra": 0.1,                  # 簇内数据重叠比例（0=完全不重叠，1=完全IID，0.1=10%重叠）
 
-        "straggler_rate": 0.5,              # 掉队概率（提高到70%，让FedAvg参与者锐减）
-        "noma_threshold": 0.2,              # NOMA信道解码下限
-        "truncation_threshold": 0.5,        # 截断门限（FedAvg/SALF用）
+        # 掉队模拟参数
+        "straggler_rate": 0.5,               # 基础掉队概率
+        "channel_threshold": 0.3,            # 信道质量门限（低于此值视为无法通信）
+        "truncation_threshold": 0.5,         # 截断门限（FedAvg/SALF用）
 
         # SALF参数
-        "salf_up_to_layer": 2,              # 掉队者更新的最后层数
+        "salf_up_to_layer": 2,               # 掉队者更新的最后层数
 
         # Proposed算法优化参数
-        "global_lr_init": 1.0,              # 全局学习率初始值
-        "global_lr_decay": 0.9998,          # 全局学习率衰减因子（每轮，更慢衰减）
+        "global_lr_init": 1.0,               # 全局学习率初始值
+        "global_lr_decay": 1,           # 全局学习率衰减因子
 
-        "use_cache": True                   # 是否使用缓存
+        "use_cache": True                    # 是否使用缓存
     }

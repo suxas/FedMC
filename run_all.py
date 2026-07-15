@@ -19,7 +19,7 @@ def execute_experiment(algo_name, config, run_func, history_path=None):
             print(f"[{algo_name}] 强制加载指定历史数据: {history_path}")
             with open(history_path, 'r', encoding='utf-8') as f:
                 return json.load(f)
-        print(f"[{algo_name}] 警告: 指定的历史文件未找到 ({history_path})，将降级处理...")
+        print(f"[{algo_name}] 未找到 ({history_path})")
 
     # 检查缓存
     if config.get('use_cache', False):
@@ -47,6 +47,6 @@ if __name__ == "__main__":
     # 运行三个算法
     results_db["Standard FedAvg"] = execute_experiment("FedAvg", base_config.copy(), run_fedavg)
     results_db["SALF (Layer-Wise)"] = execute_experiment("SALF", base_config.copy(), run_salf)
-    results_db["Proposed (Multi-modal LRMC)"] = execute_experiment("Proposed_LRMC", base_config.copy(), run_proposed)
+    results_db["Proposed (Air+LRMC)"] = execute_experiment("Proposed_LRMC", base_config.copy(), run_proposed)
 
     plot_results(results_db)

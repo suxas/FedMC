@@ -3,36 +3,36 @@ import torch.nn as nn
 
 
 # ============================================================
-# 模型配置：每个数据集独立定义，互不影响
+# 模型配置：每个数据集独立定义，复杂度递增
 # ============================================================
 
 MODEL_CONFIGS = {
-    "FashionMNIST": {
+    "MNIST": {
         "conv_channels": [16, 32],
         "use_bn": False,
-        "pool_size": (7, 7),         # 28×28 → pool后 7×7
+        "pool_size": (4, 4),           # 32×32 → pool后 4×4
         "classifier_hidden": 64,
         "classifier_dropout": 0.0,
     },
     "CIFAR10": {
-        "conv_channels": [32, 32, 64, 64],
+        "conv_channels": [32, 64, 128],
         "use_bn": True,
-        "pool_size": (4, 4),         # 32×32 → pool后 4×4
-        "classifier_hidden": 128,
-        "classifier_dropout": 0.3,
-    },
-    "SYSU-MM01": {
-        "conv_channels": [32, 32, 64, 128],
-        "use_bn": True,
-        "pool_size": (4, 4),         # 64×64 → pool后 4×4
+        "pool_size": (4, 4),           # 32×32 → pool后 4×4
         "classifier_hidden": 256,
         "classifier_dropout": 0.3,
+    },
+    "CIFAR100": {
+        "conv_channels": [64, 128, 256, 256],
+        "use_bn": True,
+        "pool_size": (4, 4),           # 32×32 → pool后 4×4
+        "classifier_hidden": 512,
+        "classifier_dropout": 0.4,
     },
 }
 
 
 # ============================================================
-# 通用模块：根据配置动态构建
+# 通用模块
 # ============================================================
 
 class FeatureExtractor(nn.Module):
@@ -85,7 +85,7 @@ class ClassifierHead(nn.Module):
 
 
 # ============================================================
-# 工厂函数：根据 config 创建模型，外部只需调用这两个
+# 工厂函数
 # ============================================================
 
 def get_model_config(dataset_name):
@@ -95,7 +95,7 @@ def get_model_config(dataset_name):
     raise ValueError(f"未知数据集: {dataset_name}, 可选: {list(MODEL_CONFIGS.keys())}")
 
 
-def create_feature_extractor(dataset_name, in_channels):
+def create_feature_extractor(dataset_name, in_channels=3):
     """根据数据集名称创建特征提取器"""
     cfg = get_model_config(dataset_name)
     return FeatureExtractor(in_channels, cfg)
