@@ -1,24 +1,20 @@
 import numpy as np
-import torch
 from tqdm import tqdm
 from nodes.clients import ClientUE
 from nodes.edges import EdgeSBS
 from nodes.server import CloudServer
-from utils.dataset import get_dataloaders
-from nodes.models import FeatureExtractor
-from main import evaluate_global_model
+from main import get_dataloaders_for_config, get_global_state_dict, create_clients, evaluate_global_model, apply_gradient_update
 
 
 def run_fedavg(config):
-    train_loaders, test_loader, num_classes = get_dataloaders(config)
-    in_channels = 3 if config['dataset'] == "CIFAR10" else 1
-    global_model = FeatureExtractor(in_channels).to(config['device'])
-    global_state_dict = global_model.state_dict()
+    """运行标准FedAvg算法：丢弃掉队者和信道质量差的客户端，其余梯度直接平均"""
+    train_loaders, test_loader, num_classes = get_dataloaders_for_config(config)
+    global_state_dict = get_global_state_dict(config, num_classes)
+    config['grad_dim'] = sum(p.numel() for p in global_state_dict.values())
 
     server = CloudServer(config)
     sbs_list = [EdgeSBS(i, config) for i in range(config['num_sbs'])]
-    clients = [ClientUE(i, config, train_loaders[i], num_classes) for i in
-               range(config['num_sbs'] * config['clients_per_sbs'])]
+    clients = create_clients(config, train_loaders, num_classes)
 
     accuracy_history, loss_history = [], []
     pbar = tqdm(range(config['global_rounds']), colour='green', desc="[Standard FedAvg]")
@@ -30,27 +26,20 @@ def run_fedavg(config):
         edge_grads = []
         for sbs in sbs_list:
             start = sbs.id * config['clients_per_sbs']
-            end = start + config['clients_per_sbs']
-            received_grads = []
+            sbs_clients = clients[start:start + config['clients_per_sbs']]
 
-            for client in clients[start:end]:
-                if client.is_straggler_state or client.channel_quality < config['truncation_threshold']:
-                    continue
-                received_grads.append(client.local_train(global_state_dict))
+            # 过滤掉队者和信道质量差的客户端
+            valid_grads = [client.local_train(global_state_dict)
+                          for client in sbs_clients
+                          if not client.is_straggler_state and client.channel_quality >= config['truncation_threshold']]
 
-            if received_grads:
-                edge_grads.append(np.mean(received_grads, axis=0))
+            if valid_grads:
+                edge_grads.append(np.mean(valid_grads, axis=0))
 
-        global_update_1d = server.global_aggregate(edge_grads)
+        # 全局聚合并更新模型参数
+        apply_gradient_update(global_state_dict, server.global_aggregate(edge_grads), config['device'])
 
-        idx = 0
-        for name, param in global_state_dict.items():
-            size = param.numel()
-            update_tensor = torch.tensor(global_update_1d[idx:idx + size]).reshape(param.shape).to(config['device'])
-            global_state_dict[name] -= update_tensor
-            idx += size
-
-        mean_acc, mean_loss = evaluate_global_model(clients, global_state_dict, test_loader, config['device'])
+        mean_acc, mean_loss = evaluate_global_model(config, global_state_dict, test_loader, config['device'])
         accuracy_history.append(mean_acc)
         loss_history.append(mean_loss)
         pbar.set_postfix(Acc=f"{mean_acc:.2f}%", Loss=f"{mean_loss:.4f}")

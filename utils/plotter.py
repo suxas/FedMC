@@ -1,78 +1,63 @@
 import matplotlib.pyplot as plt
 import os
+from datetime import datetime
 
 
 def setup_plot_style(font_family='Times New Roman', font_size=14):
-    """学术论文图表风格全局配置"""
+    """配置学术论文图表风格"""
     plt.rcParams.update({
-        'font.family': 'serif',
-        'font.serif': [font_family],
-        'font.size': font_size,
-        'axes.labelsize': font_size + 2,
-        'axes.titlesize': font_size + 2,
-        'legend.fontsize': font_size - 2,
-        'xtick.labelsize': font_size,
-        'ytick.labelsize': font_size,
-        'lines.linewidth': 2.5,
-        'lines.markersize': 8,
-        'figure.autolayout': True
+        'font.family': 'serif', 'font.serif': [font_family], 'font.size': font_size,
+        'axes.labelsize': font_size + 2, 'axes.titlesize': font_size + 2,
+        'legend.fontsize': font_size - 2, 'xtick.labelsize': font_size, 'ytick.labelsize': font_size,
+        'lines.linewidth': 2.5, 'lines.markersize': 8, 'figure.autolayout': True
     })
 
 
-def plot_results(
-        results_dict,
-        save_path="data/results/comparison.png",
-        font_family='Times New Roman',
-        font_size=14,
-        markers=None,
-        lines=None
-):
-    """绘制并保存算法对比结果 (1x2 子图，左 Acc，右 Loss)"""
+def plot_results(results_dict, save_path="data/results/comparison.png",
+                 font_family='Times New Roman', font_size=14, markers=None, lines=None):
+    """绘制算法对比图（1x2子图：左Accuracy，右Loss）并保存PNG和PDF"""
     if markers is None:
         markers = ['o', 's', '^', 'D']
     if lines is None:
         lines = ['-', '--', '-.', ':']
 
     setup_plot_style(font_family=font_family, font_size=font_size)
-
-    # 创建 1 行 2 列的图表
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
 
     for i, (algo_name, data) in enumerate(results_dict.items()):
         markevery = max(1, len(data['rounds']) // 10)
-        marker = markers[i % len(markers)]
-        linestyle = lines[i % len(lines)]
-
-        # 1. 绘制 Accuracy
-        ax1.plot(data['rounds'], data['accuracy'],
-                 label=algo_name, marker=marker, linestyle=linestyle,
+        ax1.plot(data['rounds'], data['accuracy'], label=algo_name,
+                 marker=markers[i % len(markers)], linestyle=lines[i % len(lines)],
+                 markevery=markevery, alpha=0.85)
+        ax2.plot(data['rounds'], data['loss'], label=algo_name,
+                 marker=markers[i % len(markers)], linestyle=lines[i % len(lines)],
                  markevery=markevery, alpha=0.85)
 
-        # 2. 绘制 Loss
-        ax2.plot(data['rounds'], data['loss'],
-                 label=algo_name, marker=marker, linestyle=linestyle,
-                 markevery=markevery, alpha=0.85)
+    # 设置子图属性
+    for ax, xlabel, ylabel, title, loc in [
+        (ax1, 'Global Communication Rounds', 'Test Accuracy (%)', 'Test Accuracy vs Rounds', 'lower right'),
+        (ax2, 'Global Communication Rounds', 'Test Loss', 'Test Loss vs Rounds', 'upper right')
+    ]:
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.legend(loc=loc, framealpha=0.95)
+        ax.grid(True, linestyle='--', alpha=0.6)
 
-    # 设置左图属性 (Accuracy)
-    ax1.set_xlabel('Global Communication Rounds')
-    ax1.set_ylabel('Test Accuracy (%)')
-    ax1.set_title('Test Accuracy vs Rounds')
-    ax1.legend(loc='lower right', framealpha=0.95)
-    ax1.grid(True, linestyle='--', alpha=0.6)
+    # 生成带时间戳的文件名
+    base_dir = os.path.dirname(save_path)
+    base_name = os.path.basename(save_path)
+    name_without_ext, ext = os.path.splitext(base_name)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # 设置右图属性 (Loss)
-    ax2.set_xlabel('Global Communication Rounds')
-    ax2.set_ylabel('Test Loss')
-    ax2.set_title('Test Loss vs Rounds')
-    ax2.legend(loc='upper right', framealpha=0.95)
-    ax2.grid(True, linestyle='--', alpha=0.6)
+    png_path = os.path.join(base_dir, f"{name_without_ext}_{timestamp}{ext}") if base_dir else f"{name_without_ext}_{timestamp}{ext}"
+    pdf_path = os.path.join(base_dir, f"{name_without_ext}_{timestamp}.pdf") if base_dir else f"{name_without_ext}_{timestamp}.pdf"
 
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    if base_dir:
+        os.makedirs(base_dir, exist_ok=True)
 
-    # 保存高精度图片
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    pdf_path = save_path.replace('.png', '.pdf')
+    plt.savefig(png_path, dpi=300, bbox_inches='tight')
     plt.savefig(pdf_path, dpi=300, bbox_inches='tight')
-
-    print(f"\n[Plotter] 绘图已保存至:\n  - {save_path}\n  - {pdf_path}")
     plt.close()
+
+    print(f"\n[Plotter] 绘图已保存至:\n  - {png_path}\n  - {pdf_path}")
