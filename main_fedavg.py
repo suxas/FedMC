@@ -1,61 +1,63 @@
-import numpy as np
+"""FedAvg算法：掉队者不参与聚合，除数=参与客户端数"""
+
+import torch
 from tqdm import tqdm
 from nodes.edges import EdgeSBS
-from nodes.server import CloudServer
-from main import get_dataloaders, get_global_state_dict, create_clients, evaluate_global_model, apply_gradient_update
+from nodes.models import create_model
+from utils.dataset import get_dataloaders
+from utils.common import (flatten_params, unflatten_params, local_train,
+                          evaluate, clip_grad, sim_time)
 
 
 def run_fedavg(config):
-    """运行标准FedAvg算法（McMahan et al., 2017）
-
-    原版逻辑：
-    1. 每轮随机选择部分客户端
-    2. 选中的客户端本地训练
-    3. 按数据量加权聚合（不丢弃掉队者，但掉队者不参与训练）
-    """
     train_loaders, test_loader, num_classes = get_dataloaders(config)
-    global_state_dict = get_global_state_dict(config, num_classes)
-    config['grad_dim'] = sum(p.numel() for p in global_state_dict.values())
+    device = config['device']
 
-    server = CloudServer(config)
-    clients = create_clients(config, train_loaders, num_classes)
-    client_data_sizes = [len(loader.dataset) for loader in train_loaders]
+    model = create_model(config['dataset'], num_classes).to(device)
+    p_dim = flatten_params(model).numel()
+    config['grad_dim'] = p_dim
 
-    accuracy_history, loss_history = [], []
+    n_samples = [len(loader.dataset) for loader in train_loaders]
+    u_per = config['clients_per_sbs']
+    sbs_list = [EdgeSBS(i, config) for i in range(config['num_sbs'])]
+
+    local_model = create_model(config['dataset'], num_classes).to(device)
+
+    metric_history, loss_history = [], []
     pbar = tqdm(range(config['global_rounds']), colour='green', desc="[FedAvg]")
 
     for round_idx in pbar:
-        for c in clients:
-            c.refresh_state(round_idx)
+        model.train()
+        w_global = model.state_dict()
+        edge_grads = []
+        n_valid_total = 0
 
-        # 原版FedAvg：每轮随机选择C比例的客户端
-        selected_fraction = config.get('client_fraction', 1.0)
-        if selected_fraction < 1.0:
-            num_selected = max(1, int(len(clients) * selected_fraction))
-            selected_clients = np.random.choice(clients, size=num_selected, replace=False).tolist()
-        else:
-            selected_clients = clients
+        for sbs in sbs_list:
+            start = sbs.id * u_per
+            sbs_loaders = train_loaders[start:start + u_per]
+            sbs_n_samples = n_samples[start:start + u_per]
+            times = [sum(sim_time(n, config)) for n in sbs_n_samples]
+            k = max(1, int(len(times) * (1.0 - config['straggler_rate']))) - 1
+            t_win = min(config.get('t_deadline', 99999.0), sorted(times)[k])
 
-        # 选中的客户端本地训练（掉队者也参与，但会被标记）
-        grads = []
-        weights = []
-        for client in selected_clients:
-            if not client.is_straggler_state:
-                grad = client.local_train(global_state_dict)
-                grads.append(grad)
-                weights.append(client_data_sizes[client.id])
+            valid_grads = []
+            for j, loader in enumerate(sbs_loaders):
+                if times[j] <= t_win:
+                    grad = local_train(local_model, loader, config, device, w_global)
+                    grad = clip_grad(grad)
+                    valid_grads.append(grad)
 
-        # 按数据量加权聚合
-        if grads:
-            total_weight = sum(weights)
-            weighted_grad = np.zeros_like(grads[0])
-            for g, w in zip(grads, weights):
-                weighted_grad += (w / total_weight) * g
-            apply_gradient_update(global_state_dict, weighted_grad, config['device'])
+            if valid_grads:
+                edge_grads.append(torch.stack(valid_grads).sum(dim=0))
+                n_valid_total += len(valid_grads)
 
-        mean_acc, mean_loss = evaluate_global_model(config, global_state_dict, test_loader, config['device'])
-        accuracy_history.append(mean_acc)
-        loss_history.append(mean_loss)
-        pbar.set_postfix(Acc=f"{mean_acc:.2f}%", Loss=f"{mean_loss:.4f}")
+        if edge_grads:
+            g_global = torch.stack(edge_grads).sum(dim=0) / max(n_valid_total, 1)
+            unflatten_params(model, flatten_params(model) - g_global)
 
-    return {"accuracy": accuracy_history, "loss": loss_history}
+        acc, loss = evaluate(model, test_loader, device, config)
+        metric_history.append(acc)
+        loss_history.append(loss)
+        pbar.set_postfix(Acc=f"{acc:.2f}%", Loss=f"{loss:.4f}")
+
+    return {"accuracy": metric_history, "loss": loss_history}

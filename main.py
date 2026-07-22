@@ -1,195 +1,93 @@
+"""Proposed算法：空中计算 + LRMC梯度补全 + 缓冲池 + 时间窗掉队"""
+
 import numpy as np
-import warnings
 import torch
 from tqdm import tqdm
-from nodes.clients import ClientUAV
 from nodes.edges import EdgeSBS
-from nodes.server import CloudServer
+from nodes.models import create_model
 from utils.dataset import get_dataloaders
-from nodes.models import create_feature_extractor, create_classifier
-
-
-def get_in_channels(dataset_name):
-    """所有数据集统一3通道（MNIST在数据加载时转为3通道）"""
-    return 3
-
-
-def get_global_state_dict(config, num_classes):
-    """创建全局模型并返回合并的state_dict"""
-    dataset = config['dataset']
-    in_channels = get_in_channels(dataset)
-
-    fe = create_feature_extractor(dataset, in_channels).to(config['device'])
-    feature_dim = fe.get_feature_dim()
-    cl = create_classifier(dataset, feature_dim, num_classes).to(config['device'])
-
-    global_sd = {}
-    for k, v in fe.named_parameters():
-        global_sd[f'feature_extractor.{k}'] = v.data
-    for k, v in cl.named_parameters():
-        global_sd[f'classifier.{k}'] = v.data
-    return global_sd
-
-
-def create_clients(config, train_loaders, num_classes):
-    """创建UAV客户端列表"""
-    total_clients = config['num_sbs'] * config['clients_per_sbs']
-    clients = [ClientUAV(i, config, train_loaders[i], num_classes)
-               for i in range(total_clients)]
-    return clients
-
-
-def dynamic_sparsify(grad, sparsity_ratio):
-    """动态稀疏化：保留绝对值最大的(1-sparsity_ratio)比例梯度，其余置为NaN"""
-    threshold = np.percentile(np.abs(grad), sparsity_ratio * 100)
-    return np.where(np.abs(grad) >= threshold, grad, np.nan)
-
-
-def low_rank_matrix_completion(mat, max_iter=5, tol=1e-4):
-    """迭代式低秩矩阵补全(LRMC)：Soft-Impute算法"""
-    if mat.size == 0 or np.isnan(mat).all():
-        return mat
-
-    nan_mask = np.where(np.isnan(mat))
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=RuntimeWarning)
-        col_mean = np.nanmean(mat, axis=0)
-    col_mean = np.nan_to_num(col_mean, nan=0.0)
-
-    mat_filled = np.copy(mat)
-    mat_filled[nan_mask] = np.take(col_mean, nan_mask[1])
-    mat_filled = np.nan_to_num(mat_filled, nan=0.0)
-
-    for iteration in range(max_iter):
-        mat_old = mat_filled.copy()
-
-        U, s, Vt = np.linalg.svd(mat_filled, full_matrices=False)
-        cumulative_energy = np.cumsum(s ** 2) / np.sum(s ** 2)
-        rank = np.searchsorted(cumulative_energy, 0.9) + 1
-        rank = max(1, min(rank, len(s)))
-        s[rank:] = 0
-        mat_reconstructed = U @ np.diag(s) @ Vt
-
-        mat_filled[nan_mask] = mat_reconstructed[nan_mask]
-
-        if np.linalg.norm(mat_filled - mat_old) / (np.linalg.norm(mat_old) + 1e-10) < tol:
-            break
-
-    return mat_filled
-
-
-def evaluate_global_model(config, global_state_dict, test_loader, device):
-    """使用全局模型评估准确率和损失"""
-    dataset = config['dataset']
-    in_channels = get_in_channels(dataset)
-
-    fe = create_feature_extractor(dataset, in_channels).to(device)
-    fe_keys = [k for k in global_state_dict if k.startswith('feature_extractor.')]
-    fe_sd = {k.replace('feature_extractor.', ''): global_state_dict[k] for k in fe_keys}
-    fe.load_state_dict(fe_sd, strict=False)
-
-    feature_dim = fe.get_feature_dim()
-    cl_keys = [k for k in global_state_dict if k.startswith('classifier.')]
-    num_classes = global_state_dict[[k for k in cl_keys if 'fc' in k and 'weight' in k][-1]].shape[0]
-    cl = create_classifier(dataset, feature_dim, num_classes).to(device)
-    cl_sd = {k.replace('classifier.', ''): global_state_dict[k] for k in cl_keys}
-    cl.load_state_dict(cl_sd, strict=False)
-
-    fe.eval()
-    cl.eval()
-    criterion = torch.nn.CrossEntropyLoss()
-    correct, total, running_loss = 0, 0, 0.0
-
-    with torch.no_grad():
-        for images, labels in test_loader:
-            images, labels = images.to(device), labels.to(device)
-            outputs = cl(fe(images))
-            running_loss += criterion(outputs, labels).item() * images.size(0)
-            correct += outputs.argmax(1).eq(labels).sum().item()
-            total += labels.size(0)
-
-    return 100. * correct / total, running_loss / total
-
-
-def apply_gradient_update(global_state_dict, global_update_1d, device, global_lr=1.0):
-    """将1D梯度向量应用到模型参数"""
-    idx = 0
-    for name, param in global_state_dict.items():
-        size = param.numel()
-        update = torch.tensor(global_update_1d[idx:idx + size], dtype=param.dtype).reshape(param.shape).to(device)
-        global_state_dict[name] -= global_lr * update
-        idx += size
+from utils.common import (flatten_params, unflatten_params, local_train,
+                          evaluate, clip_grad, sim_time, low_rank_matrix_completion)
 
 
 def run_proposed(config):
-    """运行Proposed算法：空中计算 + 动态稀疏化 + LRMC梯度补全 + 全局学习率衰减
-
-    流程：
-    1. 各UAV本地训练
-    2. 簇内：掉队者梯度置NaN，正常者动态稀疏化，SBS用空中计算叠加接收
-    3. SBS对簇内梯度矩阵做LRMC补全，恢复丢失分量
-    4. 簇间：LBS常规聚合各SBS的梯度
-    """
+    """Proposed：掉队者的梯度通过LRMC+缓冲池恢复，而非丢弃"""
     train_loaders, test_loader, num_classes = get_dataloaders(config)
-    global_state_dict = get_global_state_dict(config, num_classes)
-    config['grad_dim'] = sum(p.numel() for p in global_state_dict.values())
+    device = config['device']
+    total_clients = config['num_sbs'] * config['clients_per_sbs']
 
-    server = CloudServer(config)
+    model = create_model(config['dataset'], num_classes).to(device)
+    p_dim = flatten_params(model).numel()
+    config['grad_dim'] = p_dim
+
+    n_samples = [len(loader.dataset) for loader in train_loaders]
+    u_per = config['clients_per_sbs']
     sbs_list = [EdgeSBS(i, config) for i in range(config['num_sbs'])]
-    clients = create_clients(config, train_loaders, num_classes)
 
-    client_data_sizes = [len(loader.dataset) for loader in train_loaders]
+    local_model = create_model(config['dataset'], num_classes).to(device)
+    grad_buffer = {}
+    buffer_weight = config.get('buffer_weight', 0.3)
+    recovery_weight = config.get('recovery_weight', 0.7)
 
-    accuracy_history, loss_history = [], []
-    global_rounds = config['global_rounds']
-    pbar = tqdm(range(global_rounds), colour='blue', desc="[Proposed Air+LRMC]")
+    metric_history, loss_history = [], []
+    pbar = tqdm(range(config['global_rounds']), colour='blue', desc="[Proposed]")
 
     for round_idx in pbar:
-        global_lr = config.get('global_lr_init', 1.0) * (config.get('global_lr_decay', 0.999) ** round_idx)
-
-        for c in clients:
-            c.refresh_state(round_idx)
-
+        global_lr = config.get('global_lr_init', 1.0) * (config.get('global_lr_decay', 1.0) ** round_idx)
+        model.train()
+        w_global = model.state_dict()
         edge_grads = []
+
         for sbs in sbs_list:
-            start = sbs.id * config['clients_per_sbs']
-            sbs_clients = clients[start:start + config['clients_per_sbs']]
+            start = sbs.id * u_per
+            sbs_loaders = train_loaders[start:start + u_per]
+            sbs_n_samples = n_samples[start:start + u_per]
+            times = [sum(sim_time(n, config)) for n in sbs_n_samples]
+            k = max(1, int(len(times) * (1.0 - config['straggler_rate']))) - 1
+            t_win = min(config.get('t_deadline', 99999.0), sorted(times)[k])
 
-            # 收集簇内各UAV的梯度
-            grad_matrix = []
-            uav_weights = []
-
-            for client in sbs_clients:
-                raw_grad = client.local_train(global_state_dict)
-                client_weight = client_data_sizes[client.id]
-
-                if client.is_straggler_state:
-                    processed_grad = np.full_like(raw_grad, np.nan)
+            grad_list, is_valid = [], []
+            for j, loader in enumerate(sbs_loaders):
+                uav_id = start + j
+                grad = local_train(local_model, loader, config, device, w_global)
+                grad = clip_grad(grad)
+                if times[j] > t_win:
+                    hist = grad_buffer.get(uav_id)
+                    grad = hist.clone() if hist is not None else torch.full_like(grad, float('nan'))
+                    is_valid.append(False)
                 else:
-                    sparsity = 0.1 if client.channel_quality < 0.5 else 0.5
-                    processed_grad = dynamic_sparsify(raw_grad, sparsity)
+                    grad_buffer[uav_id] = grad.clone()
+                    is_valid.append(True)
+                grad_list.append(grad)
 
-                grad_matrix.append(processed_grad)
-                uav_weights.append(client_weight)
+            has_straggler = any(not v for v in is_valid)
+            if has_straggler:
+                grad_matrix = torch.stack(grad_list).cpu().numpy()
+                completed = low_rank_matrix_completion(grad_matrix)
+                for j in range(len(is_valid)):
+                    if not is_valid[j]:
+                        hist = grad_buffer.get(start + j)
+                        if hist is not None:
+                            hist_np = hist.cpu().numpy()
+                            lrmc_val = completed[j]
+                            if not np.isnan(lrmc_val).all():
+                                completed[j] = buffer_weight * hist_np + (1 - buffer_weight) * lrmc_val
+                            else:
+                                completed[j] = hist_np
+                weights = np.array([1.0 if v else recovery_weight for v in is_valid])
+                cluster_grad = np.average(completed, axis=0, weights=weights) * len(is_valid)
+                g_tensor = torch.tensor(cluster_grad, dtype=flatten_params(model).dtype, device=device)
+            else:
+                g_tensor = torch.stack(grad_list).sum(dim=0)
+            edge_grads.append(g_tensor)
 
-            # 簇内：LRMC补全 + 空中计算聚合
-            grad_array = np.array(grad_matrix)
-            completed = low_rank_matrix_completion(grad_array)
+        if edge_grads:
+            g_global = torch.stack(edge_grads).sum(dim=0) / total_clients
+            unflatten_params(model, flatten_params(model) - global_lr * g_global)
 
-            cluster_grad = sbs.air_computing_aggregate(
-                [completed[i] for i in range(len(completed))],
-                uav_weights
-            )
-            edge_grads.append(cluster_grad)
+        acc, loss = evaluate(model, test_loader, device, config)
+        metric_history.append(acc)
+        loss_history.append(loss)
+        pbar.set_postfix(Acc=f"{acc:.2f}%", Loss=f"{loss:.4f}")
 
-        # 簇间：LBS常规聚合各SBS梯度
-        global_update_1d = server.global_aggregate(edge_grads)
-        apply_gradient_update(global_state_dict, global_update_1d, config['device'], global_lr)
-
-        mean_acc, mean_loss = evaluate_global_model(config, global_state_dict, test_loader, config['device'])
-        accuracy_history.append(mean_acc)
-        loss_history.append(mean_loss)
-        pbar.set_postfix(Acc=f"{mean_acc:.2f}%", Loss=f"{mean_loss:.4f}", LR=f"{global_lr:.4f}")
-
-    return {"accuracy": accuracy_history, "loss": loss_history}
+    return {"accuracy": metric_history, "loss": loss_history}
