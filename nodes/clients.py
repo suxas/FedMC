@@ -1,95 +1,68 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from nodes.models import create_model
+import copy
+from nodes.models import ModalEncoder, SharedBackbone, ClassifierHead
 
 
-class ClientUAV:
-    """联邦学习无人机客户端"""
-
-    def __init__(self, client_id, config, train_loader, num_classes):
+class ClientUE:
+    def __init__(self, client_id, config, train_loader, test_loader, num_classes, modal_type):
         self.id = client_id
         self.config = config
         self.device = config['device']
         self.train_loader = train_loader
+        self.test_loader = test_loader
+        self.modal_type = modal_type
 
-        self.model = create_model(config['dataset'], num_classes).to(self.device)
+        self.encoder = ModalEncoder(config['dataset'], modal_type).to(self.device)
+        self.shared_backbone = SharedBackbone(config['dataset']).to(self.device)
+        self.classifier = ClassifierHead(config['dataset'], num_classes).to(self.device)
         self.criterion = nn.CrossEntropyLoss()
 
-        self.channel_quality = 1.0
-        self.is_straggler_state = False
-        self.straggler_reason = None
+    def set_global_features(self, global_backbone_state):
+        self.shared_backbone.load_state_dict(global_backbone_state)
 
-    def refresh_state(self, round_idx=0):
-        self.channel_quality = np.random.uniform(0.1, 1.0)
-        self.is_straggler_state = False
-        self.straggler_reason = None
-        if np.random.rand() < self.config['straggler_rate']:
-            self.is_straggler_state = True
-            reason_roll = np.random.rand()
-            if reason_roll < 0.4:
-                self.straggler_reason = "timeout"
-            elif reason_roll < 0.7:
-                self.straggler_reason = "out_of_range"
-            elif reason_roll < 0.85:
-                self.straggler_reason = "battery"
-            else:
-                self.straggler_reason = "hardware"
-        if self.channel_quality < self.config['channel_threshold']:
-            self.is_straggler_state = True
-            self.straggler_reason = "poor_channel"
+    def _train_epoch(self):
+        optimizer = torch.optim.SGD(
+            list(self.encoder.parameters()) +
+            list(self.shared_backbone.parameters()) +
+            list(self.classifier.parameters()),
+            lr=self.config['local_lr'], momentum=0.5
+        )
+        self.encoder.train()
+        self.shared_backbone.train()
+        self.classifier.train()
 
-    def set_global_model(self, global_state_dict):
-        self.model.load_state_dict(global_state_dict, strict=False)
-
-    def local_train(self, global_state_dict):
-        self.set_global_model(global_state_dict)
-        initial_params = {k: v.data.clone() for k, v in self.model.named_parameters()}
-
-        trainable = [p for p in self.model.parameters() if p.requires_grad]
-        optimizer = torch.optim.SGD(trainable, lr=self.config['local_lr'], momentum=0.5)
-
-        self.model.train()
-        for _ in range(self.config['local_epochs']):
-            for images, labels in self.train_loader:
-                if len(images) == 0:
+        for epoch in range(self.config['local_epochs']):
+            for img_1, img_2, labels in self.train_loader:
+                # 保护机制：防止单个样本导致 BatchNorm 崩溃
+                if len(labels) <= 1:
                     continue
-                images, labels = images.to(self.device), labels.to(self.device)
+
+                labels = labels.to(self.device)
+                inputs = img_1.to(self.device) if self.modal_type == "RGB" else img_2.to(self.device)
+
                 optimizer.zero_grad()
-                loss = self.criterion(self.model(images), labels)
+                outputs = self.classifier(self.shared_backbone(self.encoder(inputs)))
+                loss = self.criterion(outputs, labels)
                 loss.backward()
                 optimizer.step()
 
-        flat_grads = []
-        for k, p in self.model.named_parameters():
-            flat_grads.append((initial_params[k] - p.data).cpu().numpy().flatten())
-        return np.concatenate(flat_grads)
+    def local_train(self, global_backbone_state):
+        self.set_global_features(global_backbone_state)
+        # 完整的 state_dict 提取，兼容 OSNet 的 BatchNorm
+        initial_state = {k: v.clone() for k, v in self.shared_backbone.state_dict().items()}
+        self._train_epoch()
 
-    def local_train_return_state_dict(self, global_state_dict, frozen_keys=None):
-        self.set_global_model(global_state_dict)
+        curr_state = self.shared_backbone.state_dict()
+        flat_pseudo_grad = []
+        for k in initial_state.keys():
+            diff = (initial_state[k].float() - curr_state[k].float()).cpu().numpy().flatten()
+            flat_pseudo_grad.append(diff)
 
-        frozen_params = []
-        if frozen_keys:
-            for name, param in self.model.named_parameters():
-                if name in frozen_keys:
-                    param.requires_grad_(False)
-                    frozen_params.append(param)
+        return np.concatenate(flat_pseudo_grad)
 
-        trainable = [p for p in self.model.parameters() if p.requires_grad]
-        optimizer = torch.optim.SGD(trainable, lr=self.config['local_lr'], momentum=0.5)
-
-        self.model.train()
-        for _ in range(self.config['local_epochs']):
-            for images, labels in self.train_loader:
-                if len(images) == 0:
-                    continue
-                images, labels = images.to(self.device), labels.to(self.device)
-                optimizer.zero_grad()
-                loss = self.criterion(self.model(images), labels)
-                loss.backward()
-                optimizer.step()
-
-        for param in frozen_params:
-            param.requires_grad_(True)
-
-        return {k: v.data.clone() for k, v in self.model.named_parameters()}
+    def local_train_return_state_dict(self, global_backbone_state):
+        self.set_global_features(global_backbone_state)
+        self._train_epoch()
+        return copy.deepcopy(self.shared_backbone.state_dict())

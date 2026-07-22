@@ -26,11 +26,19 @@ def execute_experiment(algo_name, config, run_func, history_path=None):
 
     print(f"\n--- 开始执行: {algo_name} ({config['dataset']}) ---")
     metrics = run_func(config)
+    eval_every = config.get('eval_every', 1)
+    n_evals = len(metrics.get('loss', []))
     data = {
-        "rounds": list(range(config['global_rounds'])),
-        "accuracy": metrics["accuracy"],
-        "loss": metrics["loss"]
+        "rounds": [r * eval_every for r in range(n_evals)],
+        "loss": metrics.get("loss", [])
     }
+    # SYSU-MM01 输出 R1/mAP，MNIST/CIFAR10 输出 accuracy
+    if "R1" in metrics:
+        data["R1"] = metrics["R1"]
+        data["mAP"] = metrics["mAP"]
+    else:
+        data["accuracy"] = metrics.get("accuracy", [])
+
     logger.save_data(data)
     return data
 

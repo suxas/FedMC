@@ -15,36 +15,68 @@ def setup_plot_style(font_family='Times New Roman', font_size=14):
 
 def plot_results(results_dict, save_path="data/results/comparison.png",
                  font_family='Times New Roman', font_size=14, markers=None, lines=None):
-    """绘制算法对比图（1x2子图：左Accuracy，右Loss）并保存PNG和PDF"""
+    """绘制算法对比图并保存PNG和PDF
+    - MNIST/CIFAR10: 1x2 (Accuracy, Loss)
+    - SYSU-MM01: 1x3 (R1, mAP, Loss)
+    """
     if markers is None:
         markers = ['o', 's', '^', 'D']
     if lines is None:
         lines = ['-', '--', '-.', ':']
 
+    first_data = list(results_dict.values())[0]
+    is_reid = 'R1' in first_data
+
     setup_plot_style(font_family=font_family, font_size=font_size)
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
 
-    for i, (algo_name, data) in enumerate(results_dict.items()):
-        markevery = max(1, len(data['rounds']) // 10)
-        ax1.plot(data['rounds'], data['accuracy'], label=algo_name,
-                 marker=markers[i % len(markers)], linestyle=lines[i % len(lines)],
-                 markevery=markevery, alpha=0.85)
-        ax2.plot(data['rounds'], data['loss'], label=algo_name,
-                 marker=markers[i % len(markers)], linestyle=lines[i % len(lines)],
-                 markevery=markevery, alpha=0.85)
+    if is_reid:
+        # Re-ID: 1x3 子图
+        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(21, 6))
+        for i, (algo_name, data) in enumerate(results_dict.items()):
+            markevery = max(1, len(data['rounds']) // 10)
+            ax1.plot(data['rounds'], data['R1'], label=algo_name,
+                     marker=markers[i % len(markers)], linestyle=lines[i % len(lines)],
+                     markevery=markevery, alpha=0.85)
+            ax2.plot(data['rounds'], data['mAP'], label=algo_name,
+                     marker=markers[i % len(markers)], linestyle=lines[i % len(lines)],
+                     markevery=markevery, alpha=0.85)
+            ax3.plot(data['rounds'], data['loss'], label=algo_name,
+                     marker=markers[i % len(markers)], linestyle=lines[i % len(lines)],
+                     markevery=markevery, alpha=0.85)
 
-    # 设置子图属性
-    for ax, xlabel, ylabel, title, loc in [
-        (ax1, 'Global Communication Rounds', 'Test Accuracy (%)', 'Test Accuracy vs Rounds', 'lower right'),
-        (ax2, 'Global Communication Rounds', 'Test Loss', 'Test Loss vs Rounds', 'upper right')
-    ]:
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel(ylabel)
-        ax.set_title(title)
-        ax.legend(loc=loc, framealpha=0.95)
-        ax.grid(True, linestyle='--', alpha=0.6)
+        for ax, xlabel, ylabel, title, loc in [
+            (ax1, 'Global Communication Rounds', 'Rank-1 (%)', 'Rank-1 Accuracy', 'lower right'),
+            (ax2, 'Global Communication Rounds', 'mAP (%)', 'mAP', 'lower right'),
+            (ax3, 'Global Communication Rounds', 'Loss', 'Test Loss', 'upper right')
+        ]:
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel(ylabel)
+            ax.set_title(title)
+            ax.legend(loc=loc, framealpha=0.95)
+            ax.grid(True, linestyle='--', alpha=0.6)
+    else:
+        # 分类: 1x2 子图
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+        for i, (algo_name, data) in enumerate(results_dict.items()):
+            markevery = max(1, len(data['rounds']) // 10)
+            ax1.plot(data['rounds'], data['accuracy'], label=algo_name,
+                     marker=markers[i % len(markers)], linestyle=lines[i % len(lines)],
+                     markevery=markevery, alpha=0.85)
+            ax2.plot(data['rounds'], data['loss'], label=algo_name,
+                     marker=markers[i % len(markers)], linestyle=lines[i % len(lines)],
+                     markevery=markevery, alpha=0.85)
 
-    # 生成带时间戳的文件名
+        for ax, xlabel, ylabel, title, loc in [
+            (ax1, 'Global Communication Rounds', 'Test Accuracy (%)', 'Test Accuracy vs Rounds', 'lower right'),
+            (ax2, 'Global Communication Rounds', 'Test Loss', 'Test Loss vs Rounds', 'upper right')
+        ]:
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel(ylabel)
+            ax.set_title(title)
+            ax.legend(loc=loc, framealpha=0.95)
+            ax.grid(True, linestyle='--', alpha=0.6)
+
+    # 保存
     base_dir = os.path.dirname(save_path)
     base_name = os.path.basename(save_path)
     name_without_ext, ext = os.path.splitext(base_name)
