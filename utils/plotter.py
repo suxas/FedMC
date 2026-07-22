@@ -17,7 +17,7 @@ def plot_results(results_dict, save_path="data/results/comparison.png",
                  font_family='Times New Roman', font_size=14, markers=None, lines=None):
     """绘制算法对比图并保存PNG和PDF
     - MNIST/CIFAR10: 1x2 (Accuracy, Loss)
-    - SYSU-MM01: 1x3 (R1, mAP, Loss)
+    - SYSU-MM01: 1x3 (R1, CMC, mAP)
     """
     if markers is None:
         markers = ['o', 's', '^', 'D']
@@ -30,24 +30,24 @@ def plot_results(results_dict, save_path="data/results/comparison.png",
     setup_plot_style(font_family=font_family, font_size=font_size)
 
     if is_reid:
-        # Re-ID: 1x3 子图
+        # Re-ID: 1x3 子图 (R1, CMC, mAP)
         fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(21, 6))
         for i, (algo_name, data) in enumerate(results_dict.items()):
             markevery = max(1, len(data['rounds']) // 10)
             ax1.plot(data['rounds'], data['R1'], label=algo_name,
                      marker=markers[i % len(markers)], linestyle=lines[i % len(lines)],
                      markevery=markevery, alpha=0.85)
-            ax2.plot(data['rounds'], data['mAP'], label=algo_name,
+            ax2.plot(data['rounds'], data['CMC'], label=algo_name,
                      marker=markers[i % len(markers)], linestyle=lines[i % len(lines)],
                      markevery=markevery, alpha=0.85)
-            ax3.plot(data['rounds'], data['loss'], label=algo_name,
+            ax3.plot(data['rounds'], data['mAP'], label=algo_name,
                      marker=markers[i % len(markers)], linestyle=lines[i % len(lines)],
                      markevery=markevery, alpha=0.85)
 
         for ax, xlabel, ylabel, title, loc in [
             (ax1, 'Global Communication Rounds', 'Rank-1 (%)', 'Rank-1 Accuracy', 'lower right'),
-            (ax2, 'Global Communication Rounds', 'mAP (%)', 'mAP', 'lower right'),
-            (ax3, 'Global Communication Rounds', 'Loss', 'Test Loss', 'upper right')
+            (ax2, 'Global Communication Rounds', 'CMC@5 (%)', 'CMC@5', 'lower right'),
+            (ax3, 'Global Communication Rounds', 'mAP (%)', 'mAP', 'lower right')
         ]:
             ax.set_xlabel(xlabel)
             ax.set_ylabel(ylabel)

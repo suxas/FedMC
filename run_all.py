@@ -32,9 +32,10 @@ def execute_experiment(algo_name, config, run_func, history_path=None):
         "rounds": [r * eval_every for r in range(n_evals)],
         "loss": metrics.get("loss", [])
     }
-    # SYSU-MM01 输出 R1/mAP，MNIST/CIFAR10 输出 accuracy
+    # SYSU-MM01 输出 R1/CMC/mAP，MNIST/CIFAR10 输出 accuracy
     if "R1" in metrics:
         data["R1"] = metrics["R1"]
+        data["CMC"] = metrics["CMC"]
         data["mAP"] = metrics["mAP"]
     else:
         data["accuracy"] = metrics.get("accuracy", [])

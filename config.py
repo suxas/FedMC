@@ -5,7 +5,7 @@ def get_base_config():
     return {
         # --- 数据集设置 ---
         "dataset": "SYSU-MM01",  # 可选: "MNIST", "CIFAR10", "SYSU-MM01"
-        "global_rounds": 1,
+        "global_rounds": 100,
         "num_sbs": 3,
         "clients_per_sbs": 10,
 
@@ -15,7 +15,7 @@ def get_base_config():
         # --- 深度学习设置 ---
         "device": "cuda" if torch.cuda.is_available() else "cpu",
         "batch_size": 32,
-        "local_lr": 0.01,
+        "local_lr": 0.001,       # Re-ID 需要较小学习率
         "local_epochs": 1,
 
         # --- 数据异构性 ---

@@ -121,7 +121,7 @@ def get_dataloaders(config):
         num_classes = len(train_ds.identities)
         print(f"[*] SYSU-MM01: 找到 {num_classes} 个身份，共 {len(train_ds)} 样本。")
 
-    targets = np.array([train_ds[i][2] for i in range(len(train_ds))]) if ds_name != "SYSU-MM01" else train_ds.targets
+    targets = np.array([train_ds[i][2] for i in range(len(train_ds))]) if ds_name != "SYSUMM01" else train_ds.targets
     sbs_indices = hetero_dirichlet_partition(targets, config['num_sbs'], num_classes, config['alpha_inter'])
     client_trainloaders, client_testloaders = [], []
 
