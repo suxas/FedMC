@@ -8,6 +8,8 @@ from torchvision import datasets, transforms
 
 
 class SYSUMM01Dataset(Dataset):
+    """SYSU-MM01 行人重识别数据集，返回 (RGB图, IR图, 标签)"""
+
     def __init__(self, data_dir='./data/SYSU-MM01', transform=None):
         self.data_dir = data_dir
         self.transform = transform
@@ -73,9 +75,13 @@ class SYSUMM01Dataset(Dataset):
 
 
 class DualModalWrapper(Dataset):
-    def __init__(self, base_dataset): self.base = base_dataset
+    """将单模态数据集包装为双模态格式 (img, img, label)"""
 
-    def __len__(self): return len(self.base)
+    def __init__(self, base_dataset):
+        self.base = base_dataset
+
+    def __len__(self):
+        return len(self.base)
 
     def __getitem__(self, idx):
         img, label = self.base[idx]
@@ -83,20 +89,57 @@ class DualModalWrapper(Dataset):
 
 
 def hetero_dirichlet_partition(targets, num_clients, num_classes, alpha):
-    client_indices = [[] for _ in range(num_clients)]
+    """Dirichlet 分布异构划分（向量化版本，适用于大量类别）"""
     targets = np.array(targets)
+    client_bufs = [[] for _ in range(num_clients)]
+
+    # 一次排序，按类别分组索引
+    sorted_idx = np.argsort(targets, kind='stable')
+    class_counts = np.bincount(targets, minlength=num_classes)
+    offsets = np.zeros(num_classes + 1, dtype=int)
+    np.cumsum(class_counts, out=offsets[1:])
+
     for k in range(num_classes):
-        idx_k = np.where(targets == k)[0]
+        n_k = offsets[k + 1] - offsets[k]
+        if n_k == 0:
+            continue
+        idx_k = sorted_idx[offsets[k]:offsets[k + 1]]
         np.random.shuffle(idx_k)
-        proportions = np.random.dirichlet(np.repeat(alpha, num_clients))
-        proportions = np.cumsum(proportions) * len(idx_k)
-        splits = np.split(idx_k, proportions.astype(int)[:-1])
-        for i in range(num_clients):
-            client_indices[i].extend(splits[i])
-    return [np.array(idx) for idx in client_indices]
+        proportions = np.random.dirichlet(np.full(num_clients, alpha))
+        split_points = (np.cumsum(proportions[:-1]) * n_k).astype(int)
+        splits = np.split(idx_k, split_points)
+        for i, s in enumerate(splits):
+            if len(s) > 0:
+                client_bufs[i].append(s)
+
+    return [np.concatenate(c) if c else np.array([], dtype=int) for c in client_bufs]
+
+
+def assign_modal_types(num_clients_per_sbs, modal_split_ratio):
+    """为每个 SBS 簇内的 UAV 分配模态类型
+
+    Returns:
+        list of str: ["RGB", "IR", "Both", ...]
+    """
+    ratio = modal_split_ratio
+    n_rgb = int(num_clients_per_sbs * ratio.get("RGB", 0.4))
+    n_ir = int(num_clients_per_sbs * ratio.get("IR", 0.4))
+    n_both = num_clients_per_sbs - n_rgb - n_ir
+
+    modal_list = ["RGB"] * n_rgb + ["IR"] * n_ir + ["Both"] * n_both
+    random.shuffle(modal_list)
+    return modal_list
 
 
 def get_dataloaders(config):
+    """获取数据加载器，支持模态异构划分
+
+    Returns:
+        train_loaders: list of DataLoader (每个客户端一个)
+        test_loaders: list of DataLoader (每个客户端一个)
+        num_classes: 类别数
+        modal_types: list of str (每个客户端的模态类型)
+    """
     ds_name = config['dataset']
     sysu_transform = transforms.Compose([
         transforms.Resize((256, 128)),
@@ -122,27 +165,45 @@ def get_dataloaders(config):
         print(f"[*] SYSU-MM01: 找到 {num_classes} 个身份，共 {len(train_ds)} 样本。")
 
     targets = np.array([train_ds[i][2] for i in range(len(train_ds))]) if ds_name != "SYSUMM01" else train_ds.targets
+
+    # 簇间 Dirichlet 划分
+    print(f"[*] 簇间划分: {config['num_sbs']} 个SBS, alpha={config['alpha_inter']}")
     sbs_indices = hetero_dirichlet_partition(targets, config['num_sbs'], num_classes, config['alpha_inter'])
-    client_trainloaders, client_testloaders = [], []
+
+    client_trainloaders, client_testloaders, modal_types = [], [], []
+    modal_split_ratio = config.get('modal_split_ratio', {"RGB": 0.4, "IR": 0.4, "Both": 0.2})
 
     for sbs_id in range(config['num_sbs']):
+        print(f"[*] SBS {sbs_id}: 簇内划分 {config['clients_per_sbs']} 个客户端...")
         sbs_targets = targets[sbs_indices[sbs_id]]
+        # 簇内 Dirichlet 划分
         intra_indices = hetero_dirichlet_partition(sbs_targets, config['clients_per_sbs'], num_classes,
                                                    config['alpha_intra'])
-        for client_idx_in_sbs in intra_indices:
-            real_indices = sbs_indices[sbs_id][client_idx_in_sbs]
+
+        # 为簇内 UAV 分配模态类型
+        sbs_modal_types = assign_modal_types(config['clients_per_sbs'], modal_split_ratio)
+
+        for client_idx_in_sbs, client_modal in enumerate(sbs_modal_types):
+            real_indices = sbs_indices[sbs_id][intra_indices[client_idx_in_sbs]]
             np.random.shuffle(real_indices)
 
             split_point = max(1, int(len(real_indices) * 0.8))
             train_idx, test_idx = real_indices[:split_point], real_indices[split_point:]
             if len(test_idx) == 0: test_idx = train_idx
 
-            # 恢复简单的单线程加载
+            num_workers = config.get('num_workers', 0)
+            use_pin = config['device'] == 'cuda'
+            use_persistent = num_workers > 0
+
             client_trainloaders.append(DataLoader(
-                Subset(train_ds, train_idx), batch_size=config['batch_size'], shuffle=True
+                Subset(train_ds, train_idx), batch_size=config['batch_size'], shuffle=True,
+                num_workers=num_workers, pin_memory=use_pin, persistent_workers=use_persistent
             ))
             client_testloaders.append(DataLoader(
-                Subset(train_ds, test_idx), batch_size=128, shuffle=False
+                Subset(train_ds, test_idx), batch_size=128, shuffle=False,
+                num_workers=num_workers, pin_memory=use_pin, persistent_workers=use_persistent
             ))
+            modal_types.append(client_modal)
 
-    return client_trainloaders, client_testloaders, num_classes
+    print(f"[*] 数据划分完成: {len(client_trainloaders)} 个客户端, {num_classes} 个类别")
+    return client_trainloaders, client_testloaders, num_classes, modal_types

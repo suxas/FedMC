@@ -4,21 +4,32 @@ import torch
 from tqdm import tqdm
 from nodes.clients import ClientUE
 from nodes.models import SharedBackbone
+from nodes.edges import EdgeSBS
+from nodes.server import CloudServer
 from utils.dataset import get_dataloaders
 
 
+# ============================================================
+# 保留旧接口兼容（FedAvg/SALF 可能引用）
+# ============================================================
+
 def ota_aggregate_gradients(grads, config):
-    if not grads: return None
-    grad_sum = np.sum(grads, axis=0, dtype=np.float64)
+    """OTA 聚合梯度（旧接口，供 FedAvg/SALF 使用）"""
+    valid_grads = [g for g in grads if g is not None]
+    if not valid_grads:
+        return None
+    grad_sum = np.sum(valid_grads, axis=0, dtype=np.float64)
     signal_power = np.mean(grad_sum ** 2)
     snr_linear = 10 ** (config['ota_snr_db'] / 10)
     noise_power = signal_power / snr_linear if snr_linear > 0 else 0
-    noise = np.random.normal(0, np.sqrt(noise_power), grad_sum.shape)
-    return (grad_sum + noise) / len(grads)
+    noise = np.random.normal(0, np.sqrt(max(noise_power, 1e-10)), grad_sum.shape)
+    return (grad_sum + noise) / len(valid_grads)
 
 
 def low_rank_matrix_completion(mat):
-    if np.isnan(mat).all(): return np.zeros_like(mat)
+    """LRMC 梯度补全（旧接口）"""
+    if np.isnan(mat).all():
+        return np.zeros_like(mat)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
         col_mean = np.nanmean(mat, axis=0)
@@ -39,11 +50,17 @@ def low_rank_matrix_completion(mat):
 
 
 def evaluate_metrics(clients, global_backbone_state, device):
+    """评估指标（旧接口，供 SALF 使用）"""
     cmc5_scores, r1_scores, map_scores = [], [], []
 
     for client in clients:
         client.set_global_features(global_backbone_state)
-        client.encoder.eval()
+        if client.encoder_rgb is not None:
+            client.encoder_rgb.eval()
+        if client.encoder_ir is not None and client.encoder_ir is not client.encoder_rgb:
+            client.encoder_ir.eval()
+        if client.fusion is not None:
+            client.fusion.eval()
         client.shared_backbone.eval()
         client.classifier.eval()
 
@@ -52,11 +69,13 @@ def evaluate_metrics(clients, global_backbone_state, device):
 
         with torch.no_grad():
             for img_1, img_2, labels in client.test_loader:
-                if len(labels) == 0: continue
+                if len(labels) == 0:
+                    continue
                 labels = labels.to(device)
-                inputs = img_1.to(device) if client.modal_type == "RGB" else img_2.to(device)
+                img_rgb = img_1.to(device)
+                img_ir = img_2.to(device)
 
-                outputs = client.classifier(client.shared_backbone(client.encoder(inputs)))
+                outputs = client._forward(img_rgb, img_ir)
 
                 _, top5_preds = outputs.topk(5, 1, True, True)
                 top5_preds = top5_preds.t()
@@ -82,63 +101,81 @@ def evaluate_metrics(clients, global_backbone_state, device):
     return np.mean(cmc5_scores), np.mean(r1_scores), np.mean(map_scores)
 
 
+# ============================================================
+# Proposed 算法：LRMC + 缓冲池补偿 + 时间窗口掉队模拟
+# ============================================================
+
 def run_proposed(config):
-    train_loaders, test_loaders, num_classes = get_dataloaders(config)
+    """Proposed 算法完整流程
+
+    Step 1: LBS → SBS → UAV 广播全局模型
+    Step 2: UAV 本地训练，SBS 收集梯度、LRMC 补全、缓冲池补偿、簇内聚合
+    Step 3: SBS → LBS OTA 传输，全局聚合
+    """
+    # --- 初始化 ---
+    train_loaders, test_loaders, num_classes, modal_types = get_dataloaders(config)
     global_model = SharedBackbone(config['dataset']).to(config['device'])
     global_state_dict = global_model.state_dict()
 
+    # 创建客户端
     clients = []
     for i in range(config['num_sbs'] * config['clients_per_sbs']):
-        modal = "RGB" if (i % 2 == 0) else "IR"
+        modal = modal_types[i]
         clients.append(ClientUE(i, config, train_loaders[i], test_loaders[i], num_classes, modal))
 
-    sbs_cache = {i: [] for i in range(config['num_sbs'])}
-    cmc5_history, r1_history, map_history = [], [], []
-    pbar = tqdm(range(config['global_rounds']), colour='green', desc="[Proposed MM-OTA-LRMC]")
+    # 创建 SBS 和 LBS
+    sbs_list = [EdgeSBS(sbs_id, config) for sbs_id in range(config['num_sbs'])]
+    lbs = CloudServer(config)
+
+    # 记录历史指标
+    r1_history, map_history, loss_history = [], [], []
+    eval_every = config.get('eval_every', 5)
+    last_r1, last_map, last_loss = 0.0, 0.0, 0.0
+    pbar = tqdm(range(config['global_rounds']), colour='green', desc="[Proposed LRMC-FL]")
 
     for round_idx in pbar:
-        edge_grads = []
-        for sbs_id in range(config['num_sbs']):
-            cluster_clients = clients[sbs_id * config['clients_per_sbs']: (sbs_id + 1) * config['clients_per_sbs']]
+        # === Step 1: LBS → SBS → UAV 广播全局模型 ===
+        global_state_dict = lbs.broadcast_model(global_state_dict)
 
-            raw_grads = [c.local_train(global_state_dict) for c in cluster_clients]
-            ota_grad = ota_aggregate_gradients(raw_grads, config)
+        # === Step 2: 各 SBS 簇内处理 ===
+        edge_gradients = []
+        for sbs_id, sbs in enumerate(sbs_list):
+            start_idx = sbs_id * config['clients_per_sbs']
+            end_idx = start_idx + config['clients_per_sbs']
+            cluster_clients = clients[start_idx:end_idx]
 
-            if np.random.rand() < config['ota_drop_rate']:
-                ota_grad = np.full_like(raw_grads[0], np.nan)
+            # 2a. 收集梯度（含掉队检测）
+            grad_matrix, straggler_ids, normal_ids = sbs.collect_gradients(
+                cluster_clients, global_state_dict
+            )
 
-            sbs_cache[sbs_id].append(ota_grad)
-            if len(sbs_cache[sbs_id]) > config['time_window_size']:
-                sbs_cache[sbs_id].pop(0)
+            # 2b. LRMC 梯度补全
+            completed_matrix = sbs.lrmc_complete(grad_matrix)
 
-            grad_matrix = np.array(sbs_cache[sbs_id])
-            completed_matrix = low_rank_matrix_completion(grad_matrix)
-            edge_grads.append(completed_matrix[-1])
+            # 2c. 缓冲池补偿 + 簇内聚合
+            cluster_grad = sbs.intra_cluster_aggregate(
+                completed_matrix, straggler_ids, cluster_clients
+            )
 
-        global_update_1d = ota_aggregate_gradients(edge_grads, config)
+            # 2d. OTA 传输到 LBS
+            ota_grad = sbs.ota_to_lbs(cluster_grad)
+            edge_gradients.append(ota_grad)
 
-        idx = 0
-        for name, param in global_state_dict.items():
-            size = param.numel()
-            # 【FedBN 服务器端】：不处理 BN 统计量
-            if 'running_mean' in name or 'running_var' in name or 'num_batches_tracked' in name:
-                idx += size
-                continue
+        # === Step 3: LBS 全局聚合 ===
+        global_update = lbs.global_aggregate(edge_gradients)
+        lbs.apply_update(global_state_dict, global_update, config['device'])
 
-            update_tensor = torch.tensor(global_update_1d[idx:idx + size]).reshape(param.shape).to(config['device'])
-            updated_val = global_state_dict[name].float() - update_tensor.float()
+        # === 评估（每 eval_every 轮评估一次） ===
+        if round_idx % eval_every == 0 or round_idx == config['global_rounds'] - 1:
+            mean_r1, mean_map, mean_loss = lbs.evaluate(clients, global_state_dict, config['device'])
+            last_r1, last_map, last_loss = mean_r1, mean_map, mean_loss
+        else:
+            mean_r1, mean_map, mean_loss = last_r1, last_map, last_loss
 
-            if not global_state_dict[name].is_floating_point():
-                global_state_dict[name].copy_(updated_val.round().to(param.dtype))
-            else:
-                global_state_dict[name].copy_(updated_val.to(param.dtype))
-
-            idx += size
-
-        mean_cmc5, mean_r1, mean_map = evaluate_metrics(clients, global_state_dict, config['device'])
-        cmc5_history.append(mean_cmc5)
         r1_history.append(mean_r1)
         map_history.append(mean_map)
-        pbar.set_postfix(CMC5=f"{mean_cmc5:.2f}%", R1=f"{mean_r1:.2f}%", mAP=f"{mean_map:.2f}%")
+        loss_history.append(mean_loss)
 
-    return {"cmc5": cmc5_history, "r1": r1_history, "map": map_history}
+        pbar.set_postfix(R1=f"{mean_r1:.2f}%", mAP=f"{mean_map:.2f}%", Loss=f"{mean_loss:.4f}")
+
+    return {"r1": r1_history, "map": map_history, "loss": loss_history}

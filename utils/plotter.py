@@ -10,88 +10,51 @@ def setup_plot_style(font_family='Times New Roman', font_size=14):
         'axes.labelsize': font_size + 2, 'axes.titlesize': font_size + 2,
         'legend.fontsize': font_size - 2, 'xtick.labelsize': font_size, 'ytick.labelsize': font_size,
         'lines.linewidth': 2.5, 'lines.markersize': 8, 'figure.autolayout': True,
-        'axes.unicode_minus': False  # 预防保存图像时负号变为方块
+        'axes.unicode_minus': False
     })
 
 
 def plot_results(results_dict, save_path="data/results/comparison.png",
                  font_family='Times New Roman', font_size=14, markers=None, lines=None):
-    """绘制算法对比图并保存PNG和PDF
-    - MNIST/CIFAR10: 1x2 (Accuracy, Loss)
-    - SYSU-MM01: 1x3 (R1, CMC, mAP)
+    """绘制算法对比图并保存 PNG 和 PDF
+    所有数据集统一: 1x3 (R1, mAP, Loss)
     """
     if markers is None:
         markers = ['o', 's', '^', 'D']
     if lines is None:
         lines = ['-', '--', '-.', ':']
 
-    first_data = list(results_dict.values())[0]
-
-    # 兼容判定：同时检查大写和小写的 r1
-    is_reid = 'r1' in first_data or 'R1' in first_data
-
     setup_plot_style(font_family=font_family, font_size=font_size)
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(21, 6))
 
-    if is_reid:
-        # Re-ID: 1x3 子图 (R1, CMC, mAP)
-        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(21, 6))
-        for i, (algo_name, data) in enumerate(results_dict.items()):
-            # 容错获取指标数据（兼容之前程序的小写 key）
-            r1_data = data.get('r1', data.get('R1', []))
-            cmc_data = data.get('cmc5', data.get('CMC', []))
-            map_data = data.get('map', data.get('mAP', []))
+    for i, (algo_name, data) in enumerate(results_dict.items()):
+        r1_data = data.get('r1', data.get('R1', []))
+        map_data = data.get('mAP', data.get('map', []))
+        loss_data = data.get('loss', data.get('Loss', []))
 
-            # 动态生成 rounds 列表，防止 KeyError
-            rounds = data.get('rounds', list(range(1, len(r1_data) + 1)))
-            markevery = max(1, len(rounds) // 10)
+        rounds = data.get('rounds', list(range(1, len(r1_data) + 1)))
+        markevery = max(1, len(rounds) // 10)
 
-            ax1.plot(rounds, r1_data, label=algo_name,
-                     marker=markers[i % len(markers)], linestyle=lines[i % len(lines)],
-                     markevery=markevery, alpha=0.85)
-            ax2.plot(rounds, cmc_data, label=algo_name,
-                     marker=markers[i % len(markers)], linestyle=lines[i % len(lines)],
-                     markevery=markevery, alpha=0.85)
-            ax3.plot(rounds, map_data, label=algo_name,
-                     marker=markers[i % len(markers)], linestyle=lines[i % len(lines)],
-                     markevery=markevery, alpha=0.85)
+        ax1.plot(rounds, r1_data, label=algo_name,
+                 marker=markers[i % len(markers)], linestyle=lines[i % len(lines)],
+                 markevery=markevery, alpha=0.85)
+        ax2.plot(rounds, map_data, label=algo_name,
+                 marker=markers[i % len(markers)], linestyle=lines[i % len(lines)],
+                 markevery=markevery, alpha=0.85)
+        ax3.plot(rounds, loss_data, label=algo_name,
+                 marker=markers[i % len(markers)], linestyle=lines[i % len(lines)],
+                 markevery=markevery, alpha=0.85)
 
-        for ax, xlabel, ylabel, title, loc in [
-            (ax1, 'Global Communication Rounds', 'Rank-1 (%)', 'Rank-1 Accuracy', 'lower right'),
-            (ax2, 'Global Communication Rounds', 'CMC@5 (%)', 'CMC@5', 'lower right'),
-            (ax3, 'Global Communication Rounds', 'mAP (%)', 'mAP', 'lower right')
-        ]:
-            ax.set_xlabel(xlabel)
-            ax.set_ylabel(ylabel)
-            ax.set_title(title)
-            ax.legend(loc=loc, framealpha=0.95)
-            ax.grid(True, linestyle='--', alpha=0.6)
-    else:
-        # 分类: 1x2 子图
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-        for i, (algo_name, data) in enumerate(results_dict.items()):
-            # 容错获取分类任务数据
-            acc_data = data.get('accuracy', data.get('Accuracy', []))
-            loss_data = data.get('loss', data.get('Loss', []))
-            rounds = data.get('rounds', list(range(1, len(acc_data) + 1)))
-
-            markevery = max(1, len(rounds) // 10)
-
-            ax1.plot(rounds, acc_data, label=algo_name,
-                     marker=markers[i % len(markers)], linestyle=lines[i % len(lines)],
-                     markevery=markevery, alpha=0.85)
-            ax2.plot(rounds, loss_data, label=algo_name,
-                     marker=markers[i % len(markers)], linestyle=lines[i % len(lines)],
-                     markevery=markevery, alpha=0.85)
-
-        for ax, xlabel, ylabel, title, loc in [
-            (ax1, 'Global Communication Rounds', 'Test Accuracy (%)', 'Test Accuracy vs Rounds', 'lower right'),
-            (ax2, 'Global Communication Rounds', 'Test Loss', 'Test Loss vs Rounds', 'upper right')
-        ]:
-            ax.set_xlabel(xlabel)
-            ax.set_ylabel(ylabel)
-            ax.set_title(title)
-            ax.legend(loc=loc, framealpha=0.95)
-            ax.grid(True, linestyle='--', alpha=0.6)
+    for ax, xlabel, ylabel, title, loc in [
+        (ax1, 'Global Communication Rounds', 'Rank-1 (%)', 'Rank-1 Accuracy', 'lower right'),
+        (ax2, 'Global Communication Rounds', 'mAP (%)', 'mAP', 'lower right'),
+        (ax3, 'Global Communication Rounds', 'Test Loss', 'Test Loss', 'upper right')
+    ]:
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.legend(loc=loc, framealpha=0.95)
+        ax.grid(True, linestyle='--', alpha=0.6)
 
     # 保存
     base_dir = os.path.dirname(save_path)
