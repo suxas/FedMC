@@ -9,7 +9,8 @@ def setup_plot_style(font_family='Times New Roman', font_size=14):
         'font.family': 'serif', 'font.serif': [font_family], 'font.size': font_size,
         'axes.labelsize': font_size + 2, 'axes.titlesize': font_size + 2,
         'legend.fontsize': font_size - 2, 'xtick.labelsize': font_size, 'ytick.labelsize': font_size,
-        'lines.linewidth': 2.5, 'lines.markersize': 8, 'figure.autolayout': True
+        'lines.linewidth': 2.5, 'lines.markersize': 8, 'figure.autolayout': True,
+        'axes.unicode_minus': False  # 预防保存图像时负号变为方块
     })
 
 
@@ -25,7 +26,9 @@ def plot_results(results_dict, save_path="data/results/comparison.png",
         lines = ['-', '--', '-.', ':']
 
     first_data = list(results_dict.values())[0]
-    is_reid = 'R1' in first_data
+
+    # 兼容判定：同时检查大写和小写的 r1
+    is_reid = 'r1' in first_data or 'R1' in first_data
 
     setup_plot_style(font_family=font_family, font_size=font_size)
 
@@ -33,14 +36,22 @@ def plot_results(results_dict, save_path="data/results/comparison.png",
         # Re-ID: 1x3 子图 (R1, CMC, mAP)
         fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(21, 6))
         for i, (algo_name, data) in enumerate(results_dict.items()):
-            markevery = max(1, len(data['rounds']) // 10)
-            ax1.plot(data['rounds'], data['R1'], label=algo_name,
+            # 容错获取指标数据（兼容之前程序的小写 key）
+            r1_data = data.get('r1', data.get('R1', []))
+            cmc_data = data.get('cmc5', data.get('CMC', []))
+            map_data = data.get('map', data.get('mAP', []))
+
+            # 动态生成 rounds 列表，防止 KeyError
+            rounds = data.get('rounds', list(range(1, len(r1_data) + 1)))
+            markevery = max(1, len(rounds) // 10)
+
+            ax1.plot(rounds, r1_data, label=algo_name,
                      marker=markers[i % len(markers)], linestyle=lines[i % len(lines)],
                      markevery=markevery, alpha=0.85)
-            ax2.plot(data['rounds'], data['CMC'], label=algo_name,
+            ax2.plot(rounds, cmc_data, label=algo_name,
                      marker=markers[i % len(markers)], linestyle=lines[i % len(lines)],
                      markevery=markevery, alpha=0.85)
-            ax3.plot(data['rounds'], data['mAP'], label=algo_name,
+            ax3.plot(rounds, map_data, label=algo_name,
                      marker=markers[i % len(markers)], linestyle=lines[i % len(lines)],
                      markevery=markevery, alpha=0.85)
 
@@ -58,11 +69,17 @@ def plot_results(results_dict, save_path="data/results/comparison.png",
         # 分类: 1x2 子图
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
         for i, (algo_name, data) in enumerate(results_dict.items()):
-            markevery = max(1, len(data['rounds']) // 10)
-            ax1.plot(data['rounds'], data['accuracy'], label=algo_name,
+            # 容错获取分类任务数据
+            acc_data = data.get('accuracy', data.get('Accuracy', []))
+            loss_data = data.get('loss', data.get('Loss', []))
+            rounds = data.get('rounds', list(range(1, len(acc_data) + 1)))
+
+            markevery = max(1, len(rounds) // 10)
+
+            ax1.plot(rounds, acc_data, label=algo_name,
                      marker=markers[i % len(markers)], linestyle=lines[i % len(lines)],
                      markevery=markevery, alpha=0.85)
-            ax2.plot(data['rounds'], data['loss'], label=algo_name,
+            ax2.plot(rounds, loss_data, label=algo_name,
                      marker=markers[i % len(markers)], linestyle=lines[i % len(lines)],
                      markevery=markevery, alpha=0.85)
 
@@ -82,8 +99,10 @@ def plot_results(results_dict, save_path="data/results/comparison.png",
     name_without_ext, ext = os.path.splitext(base_name)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    png_path = os.path.join(base_dir, f"{name_without_ext}_{timestamp}{ext}") if base_dir else f"{name_without_ext}_{timestamp}{ext}"
-    pdf_path = os.path.join(base_dir, f"{name_without_ext}_{timestamp}.pdf") if base_dir else f"{name_without_ext}_{timestamp}.pdf"
+    png_path = os.path.join(base_dir,
+                            f"{name_without_ext}_{timestamp}.png") if base_dir else f"{name_without_ext}_{timestamp}.png"
+    pdf_path = os.path.join(base_dir,
+                            f"{name_without_ext}_{timestamp}.pdf") if base_dir else f"{name_without_ext}_{timestamp}.pdf"
 
     if base_dir:
         os.makedirs(base_dir, exist_ok=True)

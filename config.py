@@ -19,11 +19,11 @@ def get_base_config():
         "local_epochs": 1,
 
         # --- 数据异构性 ---
-        "alpha_inter": 0.5,
+        "alpha_inter": 0.8,
         "alpha_intra": 1,
 
         # --- OTA 通信与算法机制 ---
-        "ota_snr_db": 20.0,  # OTA 空中计算的信噪比 (dB)
+        "ota_snr_db": 30.0,  # OTA 空中计算的信噪比 (dB)
         "ota_drop_rate": 0,  # OTA 聚合完全失败的概率（模拟严重衰落）
         "time_window_size": 5,  # main.py 中时间窗缓存池大小
         "salf_up_to_layer": 2,  # main_salf.py 掉队者上传层数

@@ -20,7 +20,12 @@ class ClientUE:
         self.criterion = nn.CrossEntropyLoss()
 
     def set_global_features(self, global_backbone_state):
-        self.shared_backbone.load_state_dict(global_backbone_state)
+        # 【FedBN 核心】：绝不下载全局的 BN 统计量，保留客户端本地的方差和均值
+        local_state = self.shared_backbone.state_dict()
+        for name, param in global_backbone_state.items():
+            if 'running_mean' not in name and 'running_var' not in name and 'num_batches_tracked' not in name:
+                local_state[name].copy_(param)
+        self.shared_backbone.load_state_dict(local_state)
 
     def _train_epoch(self):
         optimizer = torch.optim.SGD(
@@ -35,7 +40,6 @@ class ClientUE:
 
         for epoch in range(self.config['local_epochs']):
             for img_1, img_2, labels in self.train_loader:
-                # 保护机制：防止单个样本导致 BatchNorm 崩溃
                 if len(labels) <= 1:
                     continue
 
@@ -46,11 +50,15 @@ class ClientUE:
                 outputs = self.classifier(self.shared_backbone(self.encoder(inputs)))
                 loss = self.criterion(outputs, labels)
                 loss.backward()
+
+                torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), max_norm=5.0)
+                torch.nn.utils.clip_grad_norm_(self.shared_backbone.parameters(), max_norm=5.0)
+                torch.nn.utils.clip_grad_norm_(self.classifier.parameters(), max_norm=5.0)
+
                 optimizer.step()
 
     def local_train(self, global_backbone_state):
         self.set_global_features(global_backbone_state)
-        # 完整的 state_dict 提取，兼容 OSNet 的 BatchNorm
         initial_state = {k: v.clone() for k, v in self.shared_backbone.state_dict().items()}
         self._train_epoch()
 

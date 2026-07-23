@@ -9,12 +9,12 @@ from utils.dataset import get_dataloaders
 
 def ota_aggregate_gradients(grads, config):
     if not grads: return None
-    grad_sum = np.sum(grads, axis=0)
+    grad_sum = np.sum(grads, axis=0, dtype=np.float64)
     signal_power = np.mean(grad_sum ** 2)
     snr_linear = 10 ** (config['ota_snr_db'] / 10)
     noise_power = signal_power / snr_linear if snr_linear > 0 else 0
     noise = np.random.normal(0, np.sqrt(noise_power), grad_sum.shape)
-    return grad_sum + noise
+    return (grad_sum + noise) / len(grads)
 
 
 def low_rank_matrix_completion(mat):
@@ -38,68 +38,48 @@ def low_rank_matrix_completion(mat):
     return mat_final
 
 
-def compute_cmc_map_from_logits(all_logits, all_labels, max_rank=20):
-    """从分类logits计算CMC和mAP（基于softmax概率排序）"""
-    probs = torch.softmax(all_logits, dim=1).numpy()
-    labels = all_labels.numpy()
-    n_query = len(labels)
+def evaluate_metrics(clients, global_backbone_state, device):
+    cmc5_scores, r1_scores, map_scores = [], [], []
 
-    # 按概率降序排序每个样本的类别
-    sorted_indices = np.argsort(-probs, axis=1)
-
-    # CMC
-    cmc = np.zeros(max_rank)
-    for rank in range(max_rank):
-        if rank == 0:
-            cmc[rank] = (sorted_indices[:, 0] == labels).sum()
-        else:
-            cmc[rank] = (sorted_indices[:, rank] == labels).sum()
-    cmc = np.cumsum(cmc) / n_query
-
-    # mAP: 对每个样本计算AP
-    ap_per_query = np.zeros(n_query)
-    for i in range(n_query):
-        true_label = labels[i]
-        rank_pos = np.where(sorted_indices[i] == true_label)[0][0]
-        # AP = 1 / (rank + 1)
-        ap_per_query[i] = 1.0 / (rank_pos + 1)
-    mAP = ap_per_query.mean()
-
-    return cmc, mAP
-
-
-def evaluate_global_model(clients, global_backbone_state, device):
-    accs, losses = [], []
-    all_logits, all_labels = [], []
-    criterion = torch.nn.CrossEntropyLoss()
     for client in clients:
         client.set_global_features(global_backbone_state)
         client.encoder.eval()
         client.shared_backbone.eval()
         client.classifier.eval()
-        correct, total, running_loss = 0, 0, 0.0
+
+        correct1, correct5, total = 0, 0, 0
+        client_preds, client_labels = [], []
+
         with torch.no_grad():
             for img_1, img_2, labels in client.test_loader:
                 if len(labels) == 0: continue
                 labels = labels.to(device)
                 inputs = img_1.to(device) if client.modal_type == "RGB" else img_2.to(device)
-                outputs = client.classifier(client.shared_backbone(client.encoder(inputs)))
-                loss = criterion(outputs, labels)
-                running_loss += loss.item() * labels.size(0)
-                _, predicted = outputs.max(1)
-                total += labels.size(0)
-                correct += predicted.eq(labels).sum().item()
-                all_logits.append(outputs.cpu())
-                all_labels.append(labels.cpu())
-        if total > 0:
-            accs.append(100. * correct / total)
-            losses.append(running_loss / total)
 
-    all_logits = torch.cat(all_logits, dim=0)
-    all_labels = torch.cat(all_labels, dim=0)
-    cmc, mAP = compute_cmc_map_from_logits(all_logits, all_labels)
-    r1 = cmc[0] * 100
-    return r1, cmc, mAP * 100, np.mean(losses)
+                outputs = client.classifier(client.shared_backbone(client.encoder(inputs)))
+
+                _, top5_preds = outputs.topk(5, 1, True, True)
+                top5_preds = top5_preds.t()
+                correct = top5_preds.eq(labels.view(1, -1).expand_as(top5_preds))
+
+                correct1 += correct[:1].reshape(-1).float().sum(0, keepdim=True).item()
+                correct5 += correct[:5].reshape(-1).float().sum(0, keepdim=True).item()
+                total += labels.size(0)
+
+                _, predicted = outputs.max(1)
+                client_preds.extend(predicted.cpu().numpy())
+                client_labels.extend(labels.cpu().numpy())
+
+        if total > 0:
+            r1_scores.append(100. * correct1 / total)
+            cmc5_scores.append(100. * correct5 / total)
+
+            preds_arr = np.array(client_preds)
+            labels_arr = np.array(client_labels)
+            ap_list = [1.0 if p == l else 0.0 for p, l in zip(preds_arr, labels_arr)]
+            map_scores.append(np.mean(ap_list) * 100 if len(ap_list) > 0 else 0.0)
+
+    return np.mean(cmc5_scores), np.mean(r1_scores), np.mean(map_scores)
 
 
 def run_proposed(config):
@@ -113,7 +93,7 @@ def run_proposed(config):
         clients.append(ClientUE(i, config, train_loaders[i], test_loaders[i], num_classes, modal))
 
     sbs_cache = {i: [] for i in range(config['num_sbs'])}
-    r1_history, cmc_history, map_history, loss_history = [], [], [], []
+    cmc5_history, r1_history, map_history = [], [], []
     pbar = tqdm(range(config['global_rounds']), colour='green', desc="[Proposed MM-OTA-LRMC]")
 
     for round_idx in pbar:
@@ -140,19 +120,25 @@ def run_proposed(config):
         idx = 0
         for name, param in global_state_dict.items():
             size = param.numel()
+            # 【FedBN 服务器端】：不处理 BN 统计量
+            if 'running_mean' in name or 'running_var' in name or 'num_batches_tracked' in name:
+                idx += size
+                continue
+
             update_tensor = torch.tensor(global_update_1d[idx:idx + size]).reshape(param.shape).to(config['device'])
             updated_val = global_state_dict[name].float() - update_tensor.float()
+
             if not global_state_dict[name].is_floating_point():
                 global_state_dict[name].copy_(updated_val.round().to(param.dtype))
             else:
                 global_state_dict[name].copy_(updated_val.to(param.dtype))
+
             idx += size
 
-        r1, cmc, mAP, mean_loss = evaluate_global_model(clients, global_state_dict, config['device'])
-        r1_history.append(r1)
-        cmc_history.append(cmc[4] * 100)  # CMC@5
-        map_history.append(mAP)
-        loss_history.append(mean_loss)
-        pbar.set_postfix(R1=f"{r1:.2f}%", CMC5=f"{cmc[4]*100:.2f}%", mAP=f"{mAP:.2f}%")
+        mean_cmc5, mean_r1, mean_map = evaluate_metrics(clients, global_state_dict, config['device'])
+        cmc5_history.append(mean_cmc5)
+        r1_history.append(mean_r1)
+        map_history.append(mean_map)
+        pbar.set_postfix(CMC5=f"{mean_cmc5:.2f}%", R1=f"{mean_r1:.2f}%", mAP=f"{mean_map:.2f}%")
 
-    return {"R1": r1_history, "CMC": cmc_history, "mAP": map_history, "loss": loss_history}
+    return {"cmc5": cmc5_history, "r1": r1_history, "map": map_history}
