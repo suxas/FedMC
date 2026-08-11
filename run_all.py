@@ -27,12 +27,11 @@ def execute_experiment(algo_name, config, run_func, history_path=None):
     print(f"\n--- 开始执行: {algo_name} ({config['dataset']}) ---")
     metrics = run_func(config)
 
-    n_rounds = len(metrics.get('r1', []))
+    n_rounds = len(metrics.get('loss', []))
     data = {
         "rounds": list(range(1, n_rounds + 1)),
-        "r1": metrics.get("r1", []),
-        "mAP": metrics.get("map", []),
-        "loss": metrics.get("loss", []),
+        "loss": metrics["loss"],
+        "acc": metrics["acc"],
     }
 
     logger.save_data(data)

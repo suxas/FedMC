@@ -16,40 +16,35 @@ def setup_plot_style(font_family='Times New Roman', font_size=14):
 
 def plot_results(results_dict, save_path="data/results/comparison.png",
                  font_family='Times New Roman', font_size=14, markers=None, lines=None):
-    """绘制算法对比图并保存 PNG 和 PDF
-    所有数据集统一: 1x3 (R1, mAP, Loss)
-    """
+    """绘制算法对比图并保存 PNG 和 PDF（分类任务：1x2 Loss + Acc）"""
     if markers is None:
         markers = ['o', 's', '^', 'D']
     if lines is None:
         lines = ['-', '--', '-.', ':']
 
     setup_plot_style(font_family=font_family, font_size=font_size)
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(21, 6))
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
 
     for i, (algo_name, data) in enumerate(results_dict.items()):
-        r1_data = data.get('r1', data.get('R1', []))
-        map_data = data.get('mAP', data.get('map', []))
         loss_data = data.get('loss', data.get('Loss', []))
-
-        rounds = data.get('rounds', list(range(1, len(r1_data) + 1)))
+        acc_data = data.get('acc', data.get('Acc', []))
+        rounds = data.get('rounds', list(range(1, len(loss_data) + 1)))
         markevery = max(1, len(rounds) // 10)
 
-        ax1.plot(rounds, r1_data, label=algo_name,
+        ax1.plot(rounds, loss_data, label=algo_name,
                  marker=markers[i % len(markers)], linestyle=lines[i % len(lines)],
                  markevery=markevery, alpha=0.85)
-        ax2.plot(rounds, map_data, label=algo_name,
-                 marker=markers[i % len(markers)], linestyle=lines[i % len(lines)],
-                 markevery=markevery, alpha=0.85)
-        ax3.plot(rounds, loss_data, label=algo_name,
+        ax2.plot(rounds, acc_data, label=algo_name,
                  marker=markers[i % len(markers)], linestyle=lines[i % len(lines)],
                  markevery=markevery, alpha=0.85)
 
-    for ax, xlabel, ylabel, title, loc in [
-        (ax1, 'Global Communication Rounds', 'Rank-1 (%)', 'Rank-1 Accuracy', 'lower right'),
-        (ax2, 'Global Communication Rounds', 'mAP (%)', 'mAP', 'lower right'),
-        (ax3, 'Global Communication Rounds', 'Test Loss', 'Test Loss', 'upper right')
-    ]:
+    axes_config = [
+        (ax1, 'Global Communication Rounds', 'Test Loss', 'Test Loss', 'upper right'),
+        (ax2, 'Global Communication Rounds', 'Accuracy (%)', 'Test Accuracy', 'lower right'),
+    ]
+
+    for ax, xlabel, ylabel, title, loc in axes_config:
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
         ax.set_title(title)

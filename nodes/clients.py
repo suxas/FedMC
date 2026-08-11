@@ -1,160 +1,106 @@
+import copy
+import random
+
 import numpy as np
 import torch
 import torch.nn as nn
-import copy
-import random
-from nodes.models import ModalEncoder, SharedBackbone, ClassifierHead, DualModalFusion
+
+from nodes.models import FederatedModel
 
 
 class ClientUE:
-    """联邦学习客户端（UAV），支持 RGB / IR / Both 三种模态"""
+    """Federated client that trains a synchronized model."""
 
-    def __init__(self, client_id, config, train_loader, test_loader, num_classes, modal_type):
+    def __init__(self, client_id, config, train_loader, test_loader, num_classes):
         self.id = client_id
         self.config = config
-        self.device = config['device']
+        self.device = config["device"]
         self.train_loader = train_loader
         self.test_loader = test_loader
-        self.modal_type = modal_type  # "RGB", "IR", "Both"
-
-        dataset = config['dataset']
-
-        # 构建编码器
-        if modal_type == "Both":
-            self.encoder_rgb = ModalEncoder(dataset, "RGB").to(self.device)
-            self.encoder_ir = ModalEncoder(dataset, "IR").to(self.device)
-            self.fusion = DualModalFusion(self.encoder_rgb.out_channels).to(self.device)
-            self.encoder = None  # 不使用单一编码器
-        elif modal_type == "RGB":
-            self.encoder = ModalEncoder(dataset, "RGB").to(self.device)
-            self.encoder_rgb = self.encoder
-            self.encoder_ir = None
-            self.fusion = None
-        else:  # IR
-            self.encoder = ModalEncoder(dataset, "IR").to(self.device)
-            self.encoder_rgb = None
-            self.encoder_ir = self.encoder
-            self.fusion = None
-
-        self.shared_backbone = SharedBackbone(dataset).to(self.device)
-        self.classifier = ClassifierHead(dataset, num_classes).to(self.device)
-        self.criterion = nn.CrossEntropyLoss()
-
-    def _get_all_local_params(self):
-        """获取所有本地参数（编码器 + 骨干 + 分类头）"""
-        params = []
-        if self.encoder_rgb is not None:
-            params.extend(self.encoder_rgb.parameters())
-        if self.encoder_ir is not None and self.encoder_ir is not self.encoder_rgb:
-            params.extend(self.encoder_ir.parameters())
-        if self.fusion is not None:
-            params.extend(self.fusion.parameters())
-        params.extend(self.shared_backbone.parameters())
-        params.extend(self.classifier.parameters())
-        return params
-
-    def _forward(self, img_rgb, img_ir):
-        """前向传播，根据模态类型选择路径"""
-        if self.modal_type == "Both":
-            feat_rgb = self.encoder_rgb(img_rgb)
-            feat_ir = self.encoder_ir(img_ir)
-            feat = self.fusion(feat_rgb, feat_ir)
-        elif self.modal_type == "RGB":
-            feat = self.encoder(img_rgb)
-        else:  # IR
-            feat = self.encoder(img_ir)
-
-        features = self.shared_backbone(feat)
-        return self.classifier(features)
-
-    def set_global_features(self, global_backbone_state):
-        """加载全局骨干网权重（FedBN: 跳过 BN 统计量）"""
-        local_state = self.shared_backbone.state_dict()
-        for name, param in global_backbone_state.items():
-            if 'running_mean' not in name and 'running_var' not in name and 'num_batches_tracked' not in name:
-                local_state[name].copy_(param)
-        self.shared_backbone.load_state_dict(local_state)
-
-    def _train_epoch(self):
-        """本地训练一个 epoch"""
-        optimizer = torch.optim.SGD(
-            self._get_all_local_params(),
-            lr=self.config['local_lr'], momentum=0.5
+        self.model = FederatedModel(config["dataset"], num_classes).to(self.device)
+        self.criterion = nn.CrossEntropyLoss(
+            label_smoothing=config.get("label_smoothing", 0.0)
         )
 
-        # 设置训练模式
-        if self.encoder_rgb is not None:
-            self.encoder_rgb.train()
-        if self.encoder_ir is not None and self.encoder_ir is not self.encoder_rgb:
-            self.encoder_ir.train()
-        if self.fusion is not None:
-            self.fusion.train()
-        self.shared_backbone.train()
-        self.classifier.train()
+    @property
+    def num_train_samples(self):
+        return len(self.train_loader.dataset)
 
+    def _make_optimizer(self):
+        return torch.optim.AdamW(
+            self.model.parameters(),
+            lr=self.config.get("local_lr", 3e-4),
+            weight_decay=self.config.get("weight_decay", 1e-4),
+        )
+
+    def set_global_features(self, global_state):
+        if set(global_state) != set(self.model.state_dict()):
+            raise ValueError("Global and local model state keys differ")
+        self.model.load_state_dict(global_state, strict=True)
+
+    def set_eval_mode(self):
+        self.model.eval()
+
+    def _train_epoch(self):
+        self.model.train()
+        optimizer = self._make_optimizer()
         total_loss = 0.0
         n_batches = 0
-
-        for epoch in range(self.config['local_epochs']):
-            for img_1, img_2, labels in self.train_loader:
-                if len(labels) <= 1:
+        for _ in range(self.config.get("local_epochs", 1)):
+            for images, labels in self.train_loader:
+                if len(labels) < 2:
                     continue
+                images = images.to(self.device, non_blocking=True)
+                labels = labels.to(self.device, non_blocking=True)
+                optimizer.zero_grad(set_to_none=True)
 
-                labels = labels.to(self.device)
-                img_rgb = img_1.to(self.device)
-                img_ir = img_2.to(self.device)
+                logits = self.model(images)
+                loss = self.criterion(logits, labels)
 
-                optimizer.zero_grad()
-                outputs = self._forward(img_rgb, img_ir)
-                loss = self.criterion(outputs, labels)
                 loss.backward()
-
-                # 梯度裁剪
-                if self.encoder_rgb is not None:
-                    torch.nn.utils.clip_grad_norm_(self.encoder_rgb.parameters(), max_norm=5.0)
-                if self.encoder_ir is not None and self.encoder_ir is not self.encoder_rgb:
-                    torch.nn.utils.clip_grad_norm_(self.encoder_ir.parameters(), max_norm=5.0)
-                if self.fusion is not None:
-                    torch.nn.utils.clip_grad_norm_(self.fusion.parameters(), max_norm=5.0)
-                torch.nn.utils.clip_grad_norm_(self.shared_backbone.parameters(), max_norm=5.0)
-                torch.nn.utils.clip_grad_norm_(self.classifier.parameters(), max_norm=5.0)
-
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
                 optimizer.step()
                 total_loss += loss.item()
                 n_batches += 1
-
         return total_loss / max(n_batches, 1)
 
-    def local_train(self, global_backbone_state):
-        """本地训练并返回伪梯度（只返回 SharedBackbone 的梯度）"""
-        self.set_global_features(global_backbone_state)
-        initial_state = {k: v.clone() for k, v in self.shared_backbone.state_dict().items()}
+    def local_train(self, global_state):
+        self.set_global_features(global_state)
+        initial = {name: value.detach().clone() for name, value in global_state.items()}
         self._train_epoch()
+        current = self.model.state_dict()
+        updates = []
+        head_split_idx = 0  # 分类头梯度的起始位置
+        head_found = False
+        for name, value in initial.items():
+            if value.is_floating_point():
+                is_head = ('fc2' in name or 'classifier' in name)
+                if is_head and not head_found:
+                    head_split_idx = sum(u.size for u in updates)
+                    head_found = True
+                difference = value.float() - current[name].float()
+                updates.append(difference.cpu().numpy().ravel())
+            else:
+                updates.append(np.zeros(value.numel(), dtype=np.float32))
+        grad = np.concatenate(updates).astype(np.float32, copy=False)
+        if not head_found:
+            head_split_idx = grad.size
+        return grad, head_split_idx
 
-        curr_state = self.shared_backbone.state_dict()
-        flat_pseudo_grad = []
-        for k in initial_state.keys():
-            diff = (initial_state[k].float() - curr_state[k].float()).cpu().numpy().flatten()
-            flat_pseudo_grad.append(diff)
-
-        return np.concatenate(flat_pseudo_grad)
-
-    def local_train_return_state_dict(self, global_backbone_state):
-        """本地训练并返回 state_dict（SALF 用）"""
-        self.set_global_features(global_backbone_state)
+    def local_train_return_state_dict(self, global_state):
+        self.set_global_features(global_state)
         self._train_epoch()
-        return copy.deepcopy(self.shared_backbone.state_dict())
+        return copy.deepcopy(self.model.state_dict())
 
-    def simulate_communication_time(self):
-        """模拟计算时间 + 传输时延，返回是否掉队"""
-        compute_time = max(0.1, random.gauss(
-            self.config.get('compute_time_mean', 0.5),
-            self.config.get('compute_time_std', 0.2)
+    def simulate_communication_time(self, round_idx=0):
+        rng = random.Random(self.config.get("seed", 42) + 1000003 * round_idx + 9176 * self.id)
+        compute_time = max(0.1, rng.gauss(
+            self.config.get("compute_time_mean", 0.5),
+            self.config.get("compute_time_std", 0.2),
         ))
-        transmit_time = max(0.05, random.gauss(
-            self.config.get('transmit_time_mean', 0.3),
-            self.config.get('transmit_time_std', 0.1)
+        transmit_time = max(0.05, rng.gauss(
+            self.config.get("transmit_time_mean", 0.3),
+            self.config.get("transmit_time_std", 0.1),
         ))
-        total_time = compute_time + transmit_time
-        is_straggler = total_time > self.config.get('time_window', 1.0)
-        return is_straggler, total_time
+        ratio = min(max(self.config.get("straggler_ratio", 0.0), 0.0), 1.0)
+        return rng.random() < ratio, compute_time + transmit_time
