@@ -17,12 +17,31 @@ class EdgeSBS:
         self._head_split_idx = None  # 分类头梯度的起始位置
 
     def collect_gradients(self, clients, global_state_dict, round_idx=0):
+        """收集梯度，参考DMFL实现SBS级别的掉队识别。
+        
+        1. 计算所有客户端的时间
+        2. 基于时间排序确定掉队阈值
+        3. 掉队者梯度置为NaN
+        """
         gradients, straggler_ids, normal_ids = [], [], []
         self._row_client_ids = [client.id for client in clients]
         head_split_idx = None
+        
+        # 计算所有客户端的时间（参考DMFL）
+        times = []
         for client in clients:
-            is_straggler, _ = client.simulate_communication_time(round_idx)
-            if is_straggler:
+            _, total_time = client.simulate_communication_time(round_idx)
+            times.append(total_time)
+        
+        # 确定时间窗口阈值（参考DMFL）
+        straggler_ratio = min(max(self.config.get("straggler_ratio", 0.5), 0.0), 1.0)
+        k = max(1, int(len(clients) * (1.0 - straggler_ratio))) - 1
+        t_win = sorted(times)[k]
+        
+        # 收集梯度
+        for client, t in zip(clients, times):
+            if t > t_win:
+                # 掉队者：梯度置为NaN
                 gradients.append(None)
                 straggler_ids.append(client.id)
                 continue
@@ -82,20 +101,6 @@ class EdgeSBS:
         max_iter = self.config.get("lrmc_max_iter", 30)
         tolerance = self.config.get("lrmc_tol", 1e-4)
         energy_ratio = min(max(self.config.get("lrmc_rank_ratio", 0.9), 0.0), 1.0)
-
-        # 自适应秩选择：基于特征值衰减率动态调整
-        # 如果特征值衰减快，说明低秩结构明显，可以用更低的秩
-        K = matrix.shape[0]
-        if K > 1:
-            try:
-                temp_eigenvalues = np.linalg.eigvalsh(filled @ filled.T)
-                temp_eigenvalues = np.sort(np.maximum(temp_eigenvalues, 0.0))[::-1]
-                if temp_eigenvalues[1] > 0:
-                    decay_rate = temp_eigenvalues[0] / temp_eigenvalues[1]
-                    if decay_rate > 10:  # 低秩结构明显
-                        energy_ratio = min(energy_ratio, 0.7)
-            except np.linalg.LinAlgError:
-                pass
 
         for _ in range(max_iter):
             previous = filled.copy()

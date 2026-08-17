@@ -18,19 +18,17 @@ class ClientUE:
         self.train_loader = train_loader
         self.test_loader = test_loader
         self.model = FederatedModel(config["dataset"], num_classes).to(self.device)
-        self.criterion = nn.CrossEntropyLoss(
-            label_smoothing=config.get("label_smoothing", 0.0)
-        )
+        self.criterion = nn.CrossEntropyLoss()
 
     @property
     def num_train_samples(self):
         return len(self.train_loader.dataset)
 
     def _make_optimizer(self):
-        return torch.optim.AdamW(
+        return torch.optim.SGD(
             self.model.parameters(),
-            lr=self.config.get("local_lr", 3e-4),
-            weight_decay=self.config.get("weight_decay", 1e-4),
+            lr=self.config.get("local_lr", 0.001),
+            momentum=self.config.get("momentum", 0.5),
         )
 
     def set_global_features(self, global_state):
@@ -93,14 +91,30 @@ class ClientUE:
         return copy.deepcopy(self.model.state_dict())
 
     def simulate_communication_time(self, round_idx=0):
+        """模拟计算和上传时间，参考DMFL实现。
+        
+        返回计算+上传的总时间，由调用方决定是否掉队。
+        使用随机CPU频率和上行速率来模拟异构性。
+        """
         rng = random.Random(self.config.get("seed", 42) + 1000003 * round_idx + 9176 * self.id)
-        compute_time = max(0.1, rng.gauss(
-            self.config.get("compute_time_mean", 0.5),
-            self.config.get("compute_time_std", 0.2),
-        ))
-        transmit_time = max(0.05, rng.gauss(
-            self.config.get("transmit_time_mean", 0.3),
-            self.config.get("transmit_time_std", 0.1),
-        ))
-        ratio = min(max(self.config.get("straggler_ratio", 0.0), 0.0), 1.0)
-        return rng.random() < ratio, compute_time + transmit_time
+        
+        # 随机CPU频率 [1GHz, 2GHz]（参考DMFL）
+        freq = rng.uniform(1e9, 2e9)
+        # 随机上行速率 [1Mbps, 5Mbps]（参考DMFL）
+        rate = rng.uniform(1e6, 5e6)
+        
+        # 计算时间 = (cycles_per_sample * n_samples) / freq
+        cycles_per_sample = 100
+        n_samples = self.num_train_samples
+        num_local_epochs = self.config.get("local_epochs", 3)
+        t_cpu = (num_local_epochs * cycles_per_sample * n_samples) / freq
+        
+        # 上传时间 = (param_size * 32 bits) / rate
+        param_size = 10000  # 约10K参数
+        t_up = (param_size * 32) / rate
+        
+        total_time = t_cpu + t_up
+        
+        # 返回时间，由调用方决定是否掉队
+        # 掉队判断基于同SBS内客户端的时间排序（参考DMFL）
+        return False, total_time

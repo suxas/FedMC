@@ -1,6 +1,6 @@
 """
-Proposed算法参数优化脚本
-支持网格搜索和贝叶斯优化两种方法
+Proposed算法参数优化脚本（使用scikit-optimize）
+真正调用run_proposed()运行联邦学习实验
 """
 
 import os
@@ -10,7 +10,6 @@ import time
 import argparse
 import numpy as np
 from datetime import datetime
-from itertools import product
 
 # 添加项目路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -18,59 +17,41 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import get_base_config
 from main import run_proposed
 
+try:
+    from skopt import gp_minimize
+    from skopt.space import Real, Integer, Categorical
+    from skopt.utils import use_named_args
+    SKOPT_AVAILABLE = True
+except ImportError:
+    SKOPT_AVAILABLE = False
+    print("[Warning] scikit-optimize 未安装，贝叶斯优化不可用")
+    print("请运行: pip install scikit-optimize")
+
 
 # ============================================================
-# 参数搜索空间定义
+# 搜索空间定义
 # ============================================================
 
-# 网格搜索参数空间
-GRID_SPACE = {
-    1: {  # 第1轮：粗搜索
-        'lrmc_rank_ratio': [0.5, 0.7, 0.8, 0.9, 0.95],
-        'compensation_weight': [0.3, 0.5, 0.7, 0.9],
-        'buffer_size': [3, 5, 7],
-        'lrmc_max_iter': [20, 30],
-        'lrmc_tol': [1e-3, 1e-4],
-    },
-    2: {  # 第2轮：细搜索（基于第1轮结果调整）
-        'lrmc_rank_ratio': [0.75, 0.80, 0.85],
-        'compensation_weight': [0.6, 0.7, 0.8],
-        'buffer_size': [4, 5, 6],
-        'lrmc_max_iter': [25, 30, 35],
-        'lrmc_tol': [5e-5, 1e-4, 5e-4],
-    },
-    3: {  # 第3轮：微调
-        'lrmc_rank_ratio': [0.78, 0.80, 0.82],
-        'compensation_weight': [0.65, 0.70, 0.75],
-        'buffer_size': [4, 5, 6],
-        'lrmc_max_iter': [28, 30, 32],
-        'lrmc_tol': [8e-5, 1e-4, 2e-4],
-    },
-}
+SEARCH_SPACE = [
+    Real(0.5, 0.99, name='lrmc_rank_ratio'),           # 对齐problem.md §5.1
+    Real(0.1, 0.95, name='compensation_weight'),
+    Integer(2, 10, name='buffer_size'),
+    Integer(5, 50, name='lrmc_max_iter'),                # 从5开始
+    Real(1e-5, 1e-2, name='lrmc_tol', prior='log-uniform'),  # 对数均匀分布
+]
 
-# 贝叶斯优化搜索边界
-BAYESIAN_BOUNDS = {
-    'lrmc_rank_ratio': (0.5, 0.95),
-    'compensation_weight': (0.1, 0.95),
-    'buffer_size': (2, 10),       # 整数
-    'lrmc_max_iter': (10, 50),    # 整数
-    'lrmc_tol': (-5, -2),         # log10尺度
-}
+# 时延权重（控制对时延的惩罚力度）
+LAMBDA_LATENCY = 0.001
 
 
 # ============================================================
 # 工具函数
 # ============================================================
 
-def create_experiment_dir(method, round_num=None):
+def create_experiment_dir():
     """创建实验目录"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if method == 'grid':
-        dir_name = f"grid_round{round_num}_{timestamp}"
-    else:
-        dir_name = f"bayesian_{timestamp}"
-    
-    exp_dir = os.path.join('optimizer', dir_name)
+    exp_dir = os.path.join('optimizer', f'bayesian_{timestamp}')
     os.makedirs(exp_dir, exist_ok=True)
     return exp_dir
 
@@ -83,282 +64,156 @@ def save_result(exp_dir, exp_id, params, results):
         'params': params,
         'results': results,
     }
-    
-    filename = f"{exp_id}.json"
-    filepath = os.path.join(exp_dir, filename)
-    
+    filepath = os.path.join(exp_dir, f'{exp_id}.json')
     with open(filepath, 'w', encoding='utf-8') as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
-    
     return filepath
-
-
-def run_single_experiment(config, params, exp_id, exp_dir):
-    """运行单个实验"""
-    # 更新配置
-    for key, value in params.items():
-        config[key] = value
-    
-    # 运行Proposed算法
-    start_time = time.time()
-    try:
-        metrics = run_proposed(config)
-        elapsed = time.time() - start_time
-        
-        # 提取结果
-        acc_history = metrics.get('acc', [])
-        loss_history = metrics.get('loss', [])
-        
-        if len(acc_history) == 0:
-            return None
-        
-        # 计算评估指标
-        final_acc = acc_history[-1]
-        final_loss = loss_history[-1] if loss_history else 0.0
-        avg_acc = np.mean(acc_history[-5:]) if len(acc_history) >= 5 else final_acc
-        
-        # 计算收敛轮次（首次达到90%最终值）
-        threshold = 0.9 * final_acc
-        convergence_round = next(
-            (i for i, acc in enumerate(acc_history) if acc >= threshold),
-            len(acc_history)
-        )
-        
-        results = {
-            'final_acc': float(final_acc),
-            'final_loss': float(final_loss),
-            'avg_acc': float(avg_acc),
-            'convergence_round': int(convergence_round),
-            'latency_per_round': float(elapsed / len(acc_history)),
-            'total_time': float(elapsed),
-            'acc_history': [float(x) for x in acc_history],
-            'loss_history': [float(x) for x in loss_history],
-        }
-        
-        # 保存结果
-        save_result(exp_dir, exp_id, params, results)
-        
-        return results
-        
-    except Exception as e:
-        print(f"[Error] 实验 {exp_id} 失败: {e}")
-        return None
-
-
-def print_progress(exp_id, total, params, results):
-    """打印进度"""
-    if results:
-        print(f"[{exp_id}/{total}] Acc={results['final_acc']:.2f}% | "
-              f"Loss={results['final_loss']:.4f} | "
-              f"Time={results['latency_per_round']:.2f}s/round | "
-              f"Params: ratio={params['lrmc_rank_ratio']}, "
-              f"weight={params['compensation_weight']}, "
-              f"buffer={params['buffer_size']}")
-    else:
-        print(f"[{exp_id}/{total}] FAILED")
-
-
-# ============================================================
-# 网格搜索
-# ============================================================
-
-def grid_search(config, round_num, exp_dir):
-    """网格搜索"""
-    space = GRID_SPACE[round_num]
-    
-    # 生成所有参数组合
-    param_names = list(space.keys())
-    param_values = list(space.values())
-    combinations = list(product(*param_values))
-    
-    total = len(combinations)
-    print(f"\n{'='*60}")
-    print(f"网格搜索 第{round_num}轮")
-    print(f"参数空间: {len(combinations)} 组合")
-    print(f"{'='*60}\n")
-    
-    best_acc = 0.0
-    best_params = None
-    all_results = []
-    
-    for i, combo in enumerate(combinations):
-        params = dict(zip(param_names, combo))
-        exp_id = f"grid_{i+1:04d}"
-        
-        results = run_single_experiment(config.copy(), params, exp_id, exp_dir)
-        print_progress(f"{i+1}/{total}", total, params, results)
-        
-        if results and results['final_acc'] > best_acc:
-            best_acc = results['final_acc']
-            best_params = params.copy()
-            all_results.append((params, results))
-    
-    # 保存最佳结果
-    if best_params:
-        best_result = {
-            'best_params': best_params,
-            'best_acc': best_acc,
-            'total_experiments': total,
-            'round': round_num,
-        }
-        
-        with open(os.path.join(exp_dir, 'best_result.json'), 'w', encoding='utf-8') as f:
-            json.dump(best_result, f, indent=2, ensure_ascii=False)
-        
-        print(f"\n{'='*60}")
-        print(f"第{round_num}轮搜索完成！")
-        print(f"最佳准确率: {best_acc:.2f}%")
-        print(f"最佳参数: {best_params}")
-        print(f"结果保存至: {exp_dir}")
-        print(f"{'='*60}\n")
-    
-    return best_params, best_acc
 
 
 # ============================================================
 # 贝叶斯优化
 # ============================================================
 
-def bayesian_optimization(config, n_iterations, exp_dir):
-    """贝叶斯优化"""
-    try:
-        from sklearn.gaussian_process import GaussianProcessRegressor
-        from sklearn.gaussian_process.kernels import Matern, WhiteKernel
-    except ImportError:
-        print("[Error] 贝叶斯优化需要 scikit-learn，请安装: pip install scikit-learn")
-        return None, 0.0
+def run_bayesian_optimization(n_calls=20, n_initial_points=5):
+    """运行贝叶斯优化"""
+    if not SKOPT_AVAILABLE:
+        print("[Error] scikit-optimize 未安装，请运行: pip install scikit-optimize")
+        return
+    
+    exp_dir = create_experiment_dir()
     
     print(f"\n{'='*60}")
-    print(f"贝叶斯优化")
-    print(f"初始采样: 5 个点")
-    print(f"迭代次数: {n_iterations} 次")
+    print(f"贝叶斯优化 (scikit-optimize)")
+    print(f"初始采样: {n_initial_points} 个点")
+    print(f"总迭代次数: {n_calls} 次")
+    print(f"时延权重: {LAMBDA_LATENCY}")
+    print(f"结果保存至: {exp_dir}")
     print(f"{'='*60}\n")
     
-    # 初始化高斯过程
-    kernel = Matern(nu=2.5) + WhiteKernel(noise_level=0.1)
-    gp = GaussianProcessRegressor(kernel=kernel, alpha=1e-6, normalize_y=True)
+    # 读取基础配置（从config.py）
+    base_config = get_base_config()
+    print(f"数据集: {base_config['dataset']}")
+    print(f"全局轮数: {base_config['global_rounds']}")
+    print(f"掉队率: {base_config['straggler_ratio']}")
+    print(f"{'='*60}\n")
     
-    # 存储观测数据
-    X_observed = []
-    y_observed = []
+    # 实验计数器
+    experiment_counter = [0]
     
-    best_acc = 0.0
-    best_params = None
-    
-    def sample_random_params():
-        """随机采样参数"""
+    @use_named_args(SEARCH_SPACE)
+    def objective(lrmc_rank_ratio, compensation_weight, buffer_size, lrmc_max_iter, lrmc_tol):
+        """目标函数：最小化 -Acc + λ*Latency"""
+        experiment_counter[0] += 1
+        exp_id = f"bayesian_{experiment_counter[0]:04d}"
+        
+        # 从config.py获取基础配置，只覆盖LRMC参数
+        config = get_base_config()
+        config['lrmc_rank_ratio'] = float(lrmc_rank_ratio)
+        config['compensation_weight'] = float(compensation_weight)
+        config['buffer_size'] = int(buffer_size)
+        config['lrmc_max_iter'] = int(lrmc_max_iter)
+        config['lrmc_tol'] = float(lrmc_tol)
+        
         params = {
-            'lrmc_rank_ratio': np.random.uniform(0.5, 0.95),
-            'compensation_weight': np.random.uniform(0.1, 0.95),
-            'buffer_size': int(np.random.choice([2, 3, 5, 7, 10])),
-            'lrmc_max_iter': int(np.random.choice([10, 20, 30, 50])),
-            'lrmc_tol': float(10 ** np.random.uniform(-5, -2)),
+            'lrmc_rank_ratio': float(lrmc_rank_ratio),
+            'compensation_weight': float(compensation_weight),
+            'buffer_size': int(buffer_size),
+            'lrmc_max_iter': int(lrmc_max_iter),
+            'lrmc_tol': float(lrmc_tol),
         }
-        return params
-    
-    def params_to_vector(params):
-        """将参数转换为向量"""
-        return np.array([
-            params['lrmc_rank_ratio'],
-            params['compensation_weight'],
-            params['buffer_size'],
-            params['lrmc_max_iter'],
-            np.log10(params['lrmc_tol']),
-        ])
-    
-    def vector_to_params(vector):
-        """将向量转换为参数"""
-        return {
-            'lrmc_rank_ratio': float(np.clip(vector[0], 0.5, 0.95)),
-            'compensation_weight': float(np.clip(vector[1], 0.1, 0.95)),
-            'buffer_size': int(np.clip(np.round(vector[2]), 2, 10)),
-            'lrmc_max_iter': int(np.clip(np.round(vector[3]), 10, 50)),
-            'lrmc_tol': float(10 ** np.clip(vector[4], -5, -2)),
-        }
-    
-    def expected_improvement(X, gp, y_best, xi=0.01):
-        """计算Expected Improvement采集函数"""
-        from scipy.stats import norm
         
-        mu, sigma = gp.predict(X, return_std=True)
-        sigma = np.maximum(sigma, 1e-9)
+        print(f"\n[{experiment_counter[0]}/{n_calls}] 测试参数:")
+        print(f"  ratio={lrmc_rank_ratio:.4f}, weight={compensation_weight:.4f}, "
+              f"buffer={buffer_size}, max_iter={lrmc_max_iter}, tol={lrmc_tol}")
         
-        Z = (y_best - mu - xi) / sigma
-        ei = (y_best - mu - xi) * norm.cdf(Z) + sigma * norm.pdf(Z)
-        
-        return ei
-    
-    # 初始随机采样
-    print("初始采样阶段...")
-    for i in range(5):
-        params = sample_random_params()
-        exp_id = f"bayesian_init_{i+1}"
-        
-        results = run_single_experiment(config.copy(), params, exp_id, exp_dir)
-        
-        if results:
-            X_observed.append(params_to_vector(params))
-            y_observed.append(results['final_acc'])
+        try:
+            # 真正运行联邦学习
+            start_time = time.time()
+            metrics = run_proposed(config)
+            elapsed = time.time() - start_time
             
-            if results['final_acc'] > best_acc:
-                best_acc = results['final_acc']
-                best_params = params.copy()
+            # 提取结果
+            acc_history = metrics.get('acc', [])
+            loss_history = metrics.get('loss', [])
             
-            print_progress(f"Init {i+1}/5", 5, params, results)
+            if len(acc_history) == 0:
+                print(f"  [Error] 实验返回空结果")
+                return 9999.0
+            
+            final_acc = acc_history[-1]
+            final_loss = loss_history[-1] if loss_history else 0.0
+            latency_per_round = elapsed / len(acc_history)
+            
+            results = {
+                'final_acc': float(final_acc),
+                'final_loss': float(final_loss),
+                'latency_per_round': float(latency_per_round),
+                'total_time': float(elapsed),
+                'acc_history': [float(x) for x in acc_history],
+                'loss_history': [float(x) for x in loss_history],
+            }
+            
+            # 保存结果
+            save_result(exp_dir, exp_id, params, results)
+            
+            # 计算目标函数值：-Acc + λ*Latency + 稳定性惩罚
+            acc_std = np.std(acc_history[-50:]) if len(acc_history) >= 50 else 0
+            score = -final_acc + LAMBDA_LATENCY * latency_per_round + 0.1 * acc_std
+            
+            print(f"  -> Acc={final_acc:.2f}%, Loss={final_loss:.4f}, "
+                  f"Time={latency_per_round:.2f}s/round, Score={score:.4f}")
+            
+            return score
+            
+        except Exception as e:
+            print(f"  [Error] 实验失败: {e}")
+            return 9999.0
     
-    # 迭代优化
-    print("\n迭代优化阶段...")
-    for iteration in range(n_iterations):
-        # 拟合高斯过程
-        X = np.array(X_observed)
-        y = np.array(y_observed)
-        gp.fit(X, y)
-        
-        # 网格搜索采集函数最大值
-        n_candidates = 1000
-        X_candidates = np.random.uniform(
-            [0.5, 0.1, 2, 10, -5],
-            [0.95, 0.95, 10, 50, -2],
-            size=(n_candidates, 5)
-        )
-        
-        # 计算EI
-        ei = expected_improvement(X_candidates, gp, best_acc)
-        best_idx = np.argmax(ei)
-        next_params = vector_to_params(X_candidates[best_idx])
-        
-        # 运行实验
-        exp_id = f"bayesian_iter_{iteration+1}"
-        results = run_single_experiment(config.copy(), next_params, exp_id, exp_dir)
-        
-        if results:
-            X_observed.append(params_to_vector(next_params))
-            y_observed.append(results['final_acc'])
-            
-            if results['final_acc'] > best_acc:
-                best_acc = results['final_acc']
-                best_params = next_params.copy()
-            
-            print_progress(f"Iter {iteration+1}/{n_iterations}", n_iterations, next_params, results)
+    # 运行贝叶斯优化
+    result = gp_minimize(
+        func=objective,
+        dimensions=SEARCH_SPACE,
+        n_calls=n_calls,
+        n_initial_points=n_initial_points,
+        acq_func='EI',
+        xi=0.05,
+        noise='gaussian',
+        random_state=42,
+        verbose=False,
+    )
+    
+    # 提取最佳结果
+    best_params = {
+        'lrmc_rank_ratio': float(result.x[0]),
+        'compensation_weight': float(result.x[1]),
+        'buffer_size': int(result.x[2]),
+        'lrmc_max_iter': int(result.x[3]),
+        'lrmc_tol': float(result.x[4]),
+    }
+    best_acc = -result.fun  # 转换回准确率
     
     # 保存最佳结果
-    if best_params:
-        best_result = {
-            'best_params': best_params,
-            'best_acc': best_acc,
-            'total_experiments': 5 + n_iterations,
-            'method': 'bayesian',
-        }
-        
-        with open(os.path.join(exp_dir, 'best_result.json'), 'w', encoding='utf-8') as f:
-            json.dump(best_result, f, indent=2, ensure_ascii=False)
-        
-        print(f"\n{'='*60}")
-        print(f"贝叶斯优化完成！")
-        print(f"最佳准确率: {best_acc:.2f}%")
-        print(f"最佳参数: {best_params}")
-        print(f"结果保存至: {exp_dir}")
-        print(f"{'='*60}\n")
+    best_result = {
+        'best_params': best_params,
+        'best_acc': float(best_acc),
+        'total_experiments': experiment_counter[0],
+        'method': 'bayesian_skopt',
+        'config': {
+            'dataset': base_config['dataset'],
+            'global_rounds': base_config['global_rounds'],
+            'straggler_ratio': base_config['straggler_ratio'],
+        },
+    }
+    
+    with open(os.path.join(exp_dir, 'best_result.json'), 'w', encoding='utf-8') as f:
+        json.dump(best_result, f, indent=2, ensure_ascii=False)
+    
+    print(f"\n{'='*60}")
+    print(f"贝叶斯优化完成！")
+    print(f"最佳准确率: {best_acc:.2f}%")
+    print(f"最佳参数: {best_params}")
+    print(f"结果保存至: {exp_dir}")
+    print(f"{'='*60}\n")
     
     return best_params, best_acc
 
@@ -368,7 +223,7 @@ def bayesian_optimization(config, n_iterations, exp_dir):
 # ============================================================
 
 def analyze_results(exp_dir):
-    """分析实验结果"""
+    """分析实验结果，包含参数敏感性分析"""
     results = []
     
     for filename in os.listdir(exp_dir):
@@ -395,11 +250,11 @@ def analyze_results(exp_dir):
     print("-" * 60)
     for i, r in enumerate(results[:10]):
         print(f"{i+1}. Acc={r['results']['final_acc']:.2f}% | "
-              f"ratio={r['params']['lrmc_rank_ratio']}, "
-              f"weight={r['params']['compensation_weight']}, "
+              f"ratio={r['params']['lrmc_rank_ratio']:.4f}, "
+              f"weight={r['params']['compensation_weight']:.4f}, "
               f"buffer={r['params']['buffer_size']}, "
               f"iter={r['params']['lrmc_max_iter']}, "
-              f"tol={r['params']['lrmc_tol']}")
+              f"tol={r['params']['lrmc_tol']:.2e}")
     
     # 统计信息
     accs = [r['results']['final_acc'] for r in results]
@@ -408,27 +263,91 @@ def analyze_results(exp_dir):
     print(f"  标准差: {np.std(accs):.2f}%")
     print(f"  最小值: {np.min(accs):.2f}%")
     print(f"  最大值: {np.max(accs):.2f}%")
+    
+    # 参数敏感性分析（problem.md §5.6）
+    if len(results) >= 5:
+        print(f"\n参数敏感性分析 (Pearson相关系数):")
+        print("-" * 60)
+        param_names = ['lrmc_rank_ratio', 'compensation_weight', 'buffer_size', 'lrmc_max_iter', 'lrmc_tol']
+        for param in param_names:
+            values = [r['params'][param] for r in results]
+            if len(set(values)) > 1:  # 需要有变化才能计算相关系数
+                corr = np.corrcoef(values, accs)[0, 1]
+                direction = "↑" if corr > 0 else "↓"
+                strength = "强" if abs(corr) > 0.5 else "中" if abs(corr) > 0.3 else "弱"
+                print(f"  {param:25s}: r={corr:+.3f} ({strength}正相关 {direction})" if corr > 0 
+                      else f"  {param:25s}: r={corr:+.3f} ({strength}负相关 {direction})")
 
 
-def compare_methods():
-    """对比不同优化方法的结果"""
-    optimizer_dir = 'optimizer'
+def plot_optimization_results(exp_dir):
+    """绘制参数-准确率散点图和敏感性分析"""
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[Warning] matplotlib 未安装，无法绘图")
+        print("请运行: pip install matplotlib")
+        return
     
-    print(f"\n{'='*60}")
-    print(f"优化方法对比")
-    print(f"{'='*60}\n")
+    results = []
+    for filename in os.listdir(exp_dir):
+        if filename.endswith('.json') and filename != 'best_result.json':
+            filepath = os.path.join(exp_dir, filename)
+            with open(filepath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                results.append(data)
     
-    for method_dir in os.listdir(optimizer_dir):
-        method_path = os.path.join(optimizer_dir, method_dir)
-        if os.path.isdir(method_path):
-            best_file = os.path.join(method_path, 'best_result.json')
-            if os.path.exists(best_file):
-                with open(best_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    print(f"{method_dir}:")
-                    print(f"  最佳准确率: {data['best_acc']:.2f}%")
-                    print(f"  最佳参数: {data['best_params']}")
-                    print()
+    if len(results) < 3:
+        print("实验结果不足，无法绘图")
+        return
+    
+    param_names = ['lrmc_rank_ratio', 'compensation_weight', 'buffer_size', 'lrmc_max_iter', 'lrmc_tol']
+    param_labels = ['Rank Ratio (ρ)', 'Compensation Weight (α)', 'Buffer Size (B)', 
+                    'Max Iterations (T_max)', 'Tolerance (ε)']
+    accs = [r['results']['final_acc'] for r in results]
+    
+    # 创建2x3子图
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    fig.suptitle('LRMC Parameter Sensitivity Analysis', fontsize=14)
+    
+    for idx, (param, label) in enumerate(zip(param_names, param_labels)):
+        row, col = idx // 3, idx % 3
+        ax = axes[row][col]
+        values = [r['params'][param] for r in results]
+        
+        # 对tol参数使用对数坐标
+        if param == 'lrmc_tol':
+            ax.scatter(values, accs, alpha=0.6, c='steelblue', edgecolors='black', linewidth=0.5)
+            ax.set_xscale('log')
+        else:
+            ax.scatter(values, accs, alpha=0.6, c='steelblue', edgecolors='black', linewidth=0.5)
+        
+        # 添加趋势线
+        if len(set(values)) > 1:
+            z = np.polyfit(values, accs, 1)
+            p = np.poly1d(z)
+            x_line = np.linspace(min(values), max(values), 100)
+            ax.plot(x_line, p(x_line), 'r--', alpha=0.7, label=f'trend')
+            
+            # 计算相关系数
+            corr = np.corrcoef(values, accs)[0, 1]
+            ax.set_title(f'{label}\nr = {corr:.3f}')
+        else:
+            ax.set_title(f'{label}')
+        
+        ax.set_xlabel(label)
+        ax.set_ylabel('Accuracy (%)')
+        ax.grid(True, alpha=0.3)
+    
+    # 隐藏多余的子图
+    axes[1][2].set_visible(False)
+    
+    plt.tight_layout()
+    
+    # 保存图片
+    plot_path = os.path.join(exp_dir, 'sensitivity_analysis.png')
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    print(f"图片已保存至: {plot_path}")
+    plt.show()
 
 
 # ============================================================
@@ -436,47 +355,41 @@ def compare_methods():
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='Proposed算法参数优化')
-    parser.add_argument('--method', type=str, default='grid',
-                        choices=['grid', 'bayesian', 'analyze', 'compare'],
-                        help='优化方法: grid(网格搜索), bayesian(贝叶斯优化), analyze(分析结果), compare(对比方法)')
-    parser.add_argument('--round', type=int, default=1,
-                        help='网格搜索轮次 (1, 2, 3)')
-    parser.add_argument('--n_iterations', type=int, default=15,
+    parser = argparse.ArgumentParser(description='Proposed算法参数优化（参考problem.md）')
+    parser.add_argument('--method', type=str, default='bayesian',
+                        choices=['bayesian', 'analyze', 'plot'],
+                        help='优化方法: bayesian(贝叶斯优化), analyze(分析结果), plot(绘制图表)')
+    parser.add_argument('--n_iterations', type=int, default=20,
                         help='贝叶斯优化迭代次数')
     parser.add_argument('--exp_dir', type=str, default=None,
-                        help='实验结果目录（用于分析）')
+                        help='实验结果目录（用于分析/绘图）')
     
     args = parser.parse_args()
     
-    # 获取基础配置
-    config = get_base_config()
-    
-    # 减少通信轮数以加速优化
-    config['global_rounds'] = 10
-    
-    if args.method == 'grid':
-        exp_dir = create_experiment_dir('grid', args.round)
-        grid_search(config, args.round, exp_dir)
-        
-    elif args.method == 'bayesian':
-        exp_dir = create_experiment_dir('bayesian')
-        bayesian_optimization(config, args.n_iterations, exp_dir)
-        
-    elif args.method == 'analyze':
-        if args.exp_dir:
-            analyze_results(args.exp_dir)
-        else:
-            # 找到最新的实验目录
+    def get_latest_exp_dir():
+        """获取最新的实验目录"""
+        if os.path.exists('optimizer'):
             dirs = [d for d in os.listdir('optimizer') if os.path.isdir(os.path.join('optimizer', d))]
             if dirs:
-                latest_dir = os.path.join('optimizer', sorted(dirs)[-1])
-                analyze_results(latest_dir)
-            else:
-                print("没有找到实验目录")
-                
-    elif args.method == 'compare':
-        compare_methods()
+                return os.path.join('optimizer', sorted(dirs)[-1])
+        return None
+    
+    if args.method == 'bayesian':
+        run_bayesian_optimization(n_calls=args.n_iterations, n_initial_points=5)
+        
+    elif args.method == 'analyze':
+        exp_dir = args.exp_dir or get_latest_exp_dir()
+        if exp_dir:
+            analyze_results(exp_dir)
+        else:
+            print("没有找到实验目录")
+            
+    elif args.method == 'plot':
+        exp_dir = args.exp_dir or get_latest_exp_dir()
+        if exp_dir:
+            plot_optimization_results(exp_dir)
+        else:
+            print("没有找到实验目录")
 
 
 if __name__ == '__main__':

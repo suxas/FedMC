@@ -5,23 +5,21 @@ def get_base_config():
     return {
         # 数据与实验规模
         "dataset": "FashionMNIST",      # FashionMNIST / CIFAR10
-        "global_rounds": 30,           # 全局通信轮数
+        "global_rounds": 300,           # 全局通信轮数
         "num_sbs": 3,                   # 边缘基站数量
         "clients_per_sbs": 10,           # 每个基站的客户端数量
         "seed": 42,                     # 全局随机种子
 
         # 本地训练参数
         "device": "cuda" if torch.cuda.is_available() else "cpu",
-        "batch_size": 16,
-        "local_lr": 0.01,
+        "batch_size": 64,               # 参考DMFL
+        "local_lr": 0.001,              # 参考DMFL，降低学习率
         "local_epochs": 3,
-        "weight_decay": 1e-4,
-        "label_smoothing": 0.1,         # 交叉熵标签平滑系数
+        "momentum": 0.5,                # 参考DMFL，SGD动量
         "num_workers": 0,
 
-        # 数据划分异构性
-        "alpha_inter": 0.1,             # 基站间 Dirichlet 参数
-        "alpha_intra": 10.0,             # 基站内 Dirichlet 参数
+        # 数据划分异构性（
+        "inner_client_iid": 0.1,        # edge内IID数据比例 (0-1)，0.1表示10%IID+90%Non-IID
 
         # 掉队模拟：统一随机掩码
         "straggler_ratio": 0.5,

@@ -13,16 +13,17 @@ def run_proposed(config):
     Step 1: LBS → SBS → UAV 广播全局模型
     Step 2: UAV 本地训练，SBS 收集梯度、LRMC 补全、缓冲池补偿、簇内聚合
     Step 3: SBS → LBS OTA 传输，全局聚合
+    Step 4: 在官方测试集上评估
     """
     # --- 初始化 ---
-    train_loaders, test_loaders, num_classes = get_dataloaders(config)
+    train_loaders, test_loader, num_classes = get_dataloaders(config)
     global_model = FederatedModel(config['dataset'], num_classes).to(config['device'])
     global_state_dict = global_model.state_dict()
 
     # 创建客户端
     clients = []
     for i in range(config['num_sbs'] * config['clients_per_sbs']):
-        clients.append(ClientUE(i, config, train_loaders[i], test_loaders[i], num_classes))
+        clients.append(ClientUE(i, config, train_loaders[i], None, num_classes))
 
     # 创建 SBS 和 LBS
     sbs_list = [EdgeSBS(sbs_id, config) for sbs_id in range(config['num_sbs'])]
@@ -56,25 +57,30 @@ def run_proposed(config):
                 completed_matrix, straggler_ids, cluster_clients
             )
 
+            # 更新掉队者历史缓冲（LRMC恢复的梯度作为历史先验）
+            for row, client in enumerate(cluster_clients):
+                if client.id in straggler_ids:
+                    history = sbs.gradient_buffer.setdefault(client.id, [])
+                    history.append(completed_matrix[row].copy())
+                    del history[:-sbs.buffer_size]
+
             # 2d. OTA 传输到 LBS
             ota_grad = sbs.ota_to_lbs(cluster_grad)
-            edge_gradients.append((ota_grad, sum(client.num_train_samples for client in cluster_clients)))
+            edge_gradients.append((ota_grad, len(cluster_clients)))
 
-        # === Step 3: LBS 全局聚合 ===
+        # === Step 3: LBS 全局聚合（参考DMFL：求和后除以总客户端数） ===
         if edge_gradients:
-            gradients, weights = zip(*edge_gradients)
-            global_update = np.average(gradients, axis=0, weights=weights)
-        else:
-            global_update = None
-        lbs.apply_update(global_state_dict, global_update, config['device'])
+            total_clients = sum(w for _, w in edge_gradients)
+            global_update = sum(g for g, _ in edge_gradients) / total_clients
+            lbs.apply_update(global_state_dict, global_update, config['device'])
 
-        # === 评估 ===
-        m1, m2, mean_loss = lbs.evaluate(clients, global_state_dict, config['device'])
+        # === Step 4: 在官方测试集上评估（参考DMFL） ===
+        acc, loss = lbs.evaluate(global_state_dict, test_loader, global_model, config['device'])
 
-        metric1_history.append(m1)
-        metric2_history.append(m2)
-        loss_history.append(mean_loss)
+        metric1_history.append(acc)
+        metric2_history.append(acc)
+        loss_history.append(loss)
 
-        pbar.set_postfix(Loss=f"{mean_loss:.4f}", Acc=f"{m1:.2f}%")
+        pbar.set_postfix(Loss=f"{loss:.4f}", Acc=f"{acc:.2f}%")
 
     return {"loss": loss_history, "acc": metric1_history}

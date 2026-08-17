@@ -4,28 +4,55 @@ import torch.nn.functional as F
 
 
 class SimpleCNN(nn.Module):
-    """适用于 FashionMNIST (1x28x28) 的轻量 CNN"""
+    """
+    FashionMNIST使用的模型
+    """
 
-    def __init__(self, in_channels=1, img_size=28, num_classes=10, kernel=5, ch1=6, ch2=50):
+    def __init__(self, in_channels=1, img_size=28, num_classes=10, kernel=5, ch1=6, ch2=50, **kwargs):
         super().__init__()
-        self.ch1 = ch1
-        size = img_size
 
-        self.conv1 = nn.Conv2d(in_channels, ch1, kernel)
-        size = (size - kernel + 1) // 2
+        # 卷积块 1 (保持空间尺寸不变: 28x28 -> 28x28)
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(in_channels, 16, kernel_size=5, padding=2),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True)
+        )
+        self.pool1 = nn.MaxPool2d(2)  # 28x28 -> 14x14
 
-        self.conv2 = nn.Conv2d(ch1, ch1, kernel)
-        size = int((size - kernel + 1) // 2)
+        # 卷积块 2 (14x14 -> 12x12)
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(16, 32, kernel_size=3),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True)
+        )
 
-        self.fc1 = nn.Linear(ch1 * size * size, ch2)
-        self.fc2 = nn.Linear(ch2, num_classes)
+        # 卷积块 3 (12x12 -> 10x10)
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(32, 64, kernel_size=3),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
+        self.pool2 = nn.MaxPool2d(2)  # 10x10 -> 5x5
+
+        # 动态推导全连接层输入维度 (默认 28x28 输入对应 5 * 5 * 64)
+        size = img_size // 2  # pool1: 14
+        size = size - 2  # conv2: 12
+        size = size - 2  # conv3: 10
+        size = size // 2  # pool2: 5
+        fc_in_features = size * size * 64
+
+        # 全连接输出层
+        self.fc = nn.Linear(fc_in_features, num_classes)
 
     def forward(self, x):
-        x = F.relu(F.max_pool2d(self.conv1(x), 2))
-        x = F.relu(F.max_pool2d(self.conv2(x), 2))
-        x = x.view(x.size(0), -1)
-        x = F.relu(self.fc1(x))
-        return self.fc2(x)
+        out = self.conv1(x)
+        out = self.pool1(out)
+        out = self.conv2(out)
+        out = self.conv3(out)
+        out = self.pool2(out)
+        out = out.view(out.size(0), -1)
+        out = self.fc(out)
+        return out
 
 
 # ---- VGG for CIFAR-10 ----

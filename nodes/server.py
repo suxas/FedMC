@@ -31,30 +31,37 @@ class CloudServer:
                 delta = torch.as_tensor(segment, device=device, dtype=torch.float32).reshape(value.shape)
                 value.copy_((value.float() - delta).to(value.dtype))
 
-    def _classification_loss_and_acc(self, clients, global_state, device):
-        losses, accuracies = [], []
-        criterion = torch.nn.CrossEntropyLoss(reduction="sum")
-        for client in clients:
-            client.set_global_features(global_state)
-            client.set_eval_mode()
-            total_loss, correct, total = 0.0, 0, 0
-            with torch.no_grad():
-                for images, labels in client.test_loader:
-                    if len(labels) == 0:
-                        continue
-                    images = images.to(device, non_blocking=True)
-                    labels = labels.to(device, non_blocking=True)
-                    logits = client.model(images)
-                    total_loss += criterion(logits, labels).item()
-                    correct += (logits.argmax(dim=1) == labels).sum().item()
-                    total += labels.numel()
-            if total:
-                losses.append(total_loss / total)
-                accuracies.append(correct / total * 100.0)
-        return float(np.mean(losses)) if losses else 0.0, float(np.mean(accuracies)) if accuracies else 0.0
-
-    def evaluate(self, clients, global_state, device):
-        if not clients:
-            return 0.0, 0.0, 0.0
-        loss, acc = self._classification_loss_and_acc(clients, global_state, device)
-        return acc, acc, loss
+    def evaluate(self, global_state, test_loader, model, device):
+        """在官方测试集上评估全局模型（参考DMFL）。
+        
+        Args:
+            global_state: 全局模型状态字典
+            test_loader: 官方测试集DataLoader
+            model: 模型实例
+            device: 计算设备
+        
+        Returns:
+            acc: 准确率 (%)
+            loss: 损失值
+        """
+        model.load_state_dict(global_state)
+        model.eval()
+        
+        correct = 0
+        total_loss = 0.0
+        total_samples = 0
+        
+        with torch.no_grad():
+            for images, labels in test_loader:
+                images = images.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
+                
+                logits = model(images)
+                total_loss += F.cross_entropy(logits, labels, reduction='sum').item()
+                correct += logits.argmax(dim=1).eq(labels).sum().item()
+                total_samples += labels.size(0)
+        
+        acc = 100.0 * correct / total_samples if total_samples > 0 else 0.0
+        loss = total_loss / total_samples if total_samples > 0 else 0.0
+        
+        return acc, loss
