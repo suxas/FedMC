@@ -1,62 +1,50 @@
 import warnings
-
 import numpy as np
 
 
 class EdgeSBS:
-    """Edge aggregation with robust LRMC and history compensation."""
+    """边缘基站 SBS：负责 LRMC 矩阵补全、历史动量融合及簇内聚合"""
 
     def __init__(self, sbs_id, config):
         self.id = sbs_id
         self.config = config
         self.buffer_size = config.get("buffer_size", 5)
-        self.compensation_weight = config.get("compensation_weight", 0.7)
+        self.compensation_weight = config.get("compensation_weight", 0.8)
         self.gradient_buffer = {}
-        self.grad_dim = config.get("grad_dim")
+        self.grad_dim = None
         self._row_client_ids = []
-        self._head_split_idx = None  # 分类头梯度的起始位置
+        self._head_split_idx = None
 
     def collect_gradients(self, clients, global_state_dict, round_idx=0):
-        """收集梯度，参考DMFL实现SBS级别的掉队识别。
-        
-        1. 计算所有客户端的时间
-        2. 基于时间排序确定掉队阈值
-        3. 掉队者梯度置为NaN
-        """
         gradients, straggler_ids, normal_ids = [], [], []
         self._row_client_ids = [client.id for client in clients]
         head_split_idx = None
-        
-        # 计算所有客户端的时间（参考DMFL）
+
         times = []
         for client in clients:
             _, total_time = client.simulate_communication_time(round_idx)
             times.append(total_time)
-        
-        # 确定时间窗口阈值（参考DMFL）
+
         straggler_ratio = min(max(self.config.get("straggler_ratio", 0.5), 0.0), 1.0)
         k = max(1, int(len(clients) * (1.0 - straggler_ratio))) - 1
         t_win = sorted(times)[k]
-        
-        # 收集梯度
+
         for client, t in zip(clients, times):
             if t > t_win:
-                # 掉队者：梯度置为NaN
                 gradients.append(None)
                 straggler_ids.append(client.id)
                 continue
+
             gradient, split_idx = client.local_train(global_state_dict)
             gradient = np.asarray(gradient).reshape(-1)
             if head_split_idx is None:
                 head_split_idx = split_idx
-            if not np.isfinite(gradient).all():
-                raise ValueError(f"Client {client.id} produced a non-finite gradient")
             if self.grad_dim is None:
                 self.grad_dim = gradient.size
-            if gradient.size != self.grad_dim:
-                raise ValueError(f"Client {client.id} gradient size mismatch")
+
             gradients.append(gradient)
             normal_ids.append(client.id)
+
             history = self.gradient_buffer.setdefault(client.id, [])
             history.append(gradient.copy())
             del history[:-self.buffer_size]
@@ -64,6 +52,7 @@ class EdgeSBS:
         if self.grad_dim is None:
             self.grad_dim = sum(value.numel() for value in global_state_dict.values())
         self._head_split_idx = head_split_idx if head_split_idx is not None else self.grad_dim
+
         matrix = np.full((len(clients), self.grad_dim), np.nan, dtype=np.float32)
         for row, gradient in enumerate(gradients):
             if gradient is not None:
@@ -71,36 +60,33 @@ class EdgeSBS:
         return matrix, straggler_ids, normal_ids
 
     def _lrmc_single_block(self, block_matrix):
-        """对单个梯度块执行LRMC补全"""
         matrix = np.asarray(block_matrix, dtype=np.float32)
         if matrix.size == 0 or np.isnan(matrix).all():
             return np.zeros_like(matrix)
         missing = np.isnan(matrix)
         if not missing.any():
             return matrix.copy()
+
         observed_rows = np.flatnonzero(~np.isnan(matrix).all(axis=1))
-        if len(observed_rows) < 2:
-            filled = np.nan_to_num(matrix, nan=0.0)
-            if len(observed_rows) == 1:
-                filled[np.isnan(matrix).all(axis=1)] = filled[observed_rows[0]]
-            return filled
+        if len(observed_rows) == 0:
+            return np.zeros_like(matrix)
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
             column_mean = np.nanmean(matrix, axis=0)
         filled = np.where(missing, np.nan_to_num(column_mean, nan=0.0), matrix)
-        # 用历史缓冲池均值作为时序先验
+
         for row in np.flatnonzero(np.isnan(matrix).all(axis=1)):
             if row < len(self._row_client_ids):
                 history = self.gradient_buffer.get(self._row_client_ids[row])
                 if history:
-                    # 只取对应block的历史梯度
                     block_size = matrix.shape[1]
                     hist_block = [h[:block_size] if len(h) >= block_size else h for h in history]
                     filled[row] = np.mean(hist_block, axis=0)
+
         max_iter = self.config.get("lrmc_max_iter", 30)
         tolerance = self.config.get("lrmc_tol", 1e-4)
-        energy_ratio = min(max(self.config.get("lrmc_rank_ratio", 0.9), 0.0), 1.0)
+        energy_ratio = min(max(self.config.get("lrmc_rank_ratio", 0.8), 0.0), 1.0)
 
         for _ in range(max_iter):
             previous = filled.copy()
@@ -119,31 +105,33 @@ class EdgeSBS:
             relative_change = np.linalg.norm(filled - previous) / (np.linalg.norm(previous) + 1e-10)
             if relative_change < tolerance:
                 break
-        return np.nan_to_num(filled, nan=0.0, posinf=0.0, neginf=0.0)
+
+        return np.nan_to_num(filled, nan=0.0)
 
     def lrmc_complete(self, grad_matrix):
-        """对backbone部分做LRMC补全，分类头部分用列均值填充"""
         matrix = np.asarray(grad_matrix, dtype=np.float32)
-        if matrix.size == 0 or np.isnan(matrix).all():
-            return np.zeros_like(matrix)
-        if not np.isnan(matrix).any():
-            return matrix.copy()
+        if matrix.size == 0 or not np.isnan(matrix).any():
+            return np.nan_to_num(matrix, nan=0.0)
 
         split = self._head_split_idx if self._head_split_idx is not None else matrix.shape[1]
 
-        # Backbone部分：LRMC低秩补全
         backbone_block = matrix[:, :split]
         completed_backbone = self._lrmc_single_block(backbone_block)
 
-        # 分类头部分：列均值填充（不做低秩投影）
         head_block = matrix[:, split:]
         if head_block.shape[1] > 0 and np.isnan(head_block).any():
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", RuntimeWarning)
                 col_mean = np.nanmean(head_block, axis=0)
             col_mean = np.nan_to_num(col_mean, nan=0.0)
-            head_missing = np.isnan(head_block)
-            completed_head = np.where(head_missing, col_mean, head_block)
+            completed_head = np.where(np.isnan(head_block), col_mean, head_block)
+            for row in np.flatnonzero(np.isnan(head_block).all(axis=1)):
+                if row < len(self._row_client_ids):
+                    history = self.gradient_buffer.get(self._row_client_ids[row])
+                    if history:
+                        hist_head = [h[split:] for h in history if len(h) > split]
+                        if hist_head:
+                            completed_head[row] = np.mean(hist_head, axis=0)
         else:
             completed_head = head_block
 
@@ -153,37 +141,39 @@ class EdgeSBS:
         history = self.gradient_buffer.get(client_id)
         if not history:
             return lrmc_gradient
-        # 按轮次衰减加权：越近的梯度权重越大
+
         n_history = len(history)
-        decay_factor = 0.9  # 每过一轮权重衰减10%
+        decay_factor = 0.9
         decay_weights = np.array([decay_factor ** (n_history - 1 - i) for i in range(n_history)])
         decay_weights /= decay_weights.sum()
         historical = np.average(history, axis=0, weights=decay_weights)
+
         lrmc_norm = np.linalg.norm(lrmc_gradient)
         history_norm = np.linalg.norm(historical)
+
         if lrmc_norm > 0 and history_norm > 0:
             cosine = float(np.dot(lrmc_gradient, historical) / (lrmc_norm * history_norm + 1e-12))
             confidence = max(0.0, cosine)
-            lrmc_weight = self.compensation_weight * confidence
-            history_weight = 1.0 - lrmc_weight
-            result = lrmc_weight * lrmc_gradient + history_weight * historical
-            max_norm = 1.5 * history_norm
-            result_norm = np.linalg.norm(result)
-            if result_norm > max_norm:
-                result = result * (max_norm / (result_norm + 1e-12))
+            # 在高维网络下进行保底加权平滑
+            alpha = self.compensation_weight * (0.5 + 0.5 * confidence)
+            result = alpha * lrmc_gradient + (1.0 - alpha) * historical
             return result
-        return historical
+        return historical if history_norm > 0 else lrmc_gradient
 
     def intra_cluster_aggregate(self, grad_matrix, straggler_ids, clients):
         matrix = np.asarray(grad_matrix).copy()
         if matrix.size == 0:
-            return np.zeros(self.grad_dim or 0, dtype=np.float32)
+            return np.zeros(self.grad_dim or 0, dtype=np.float32), 0
+
         stragglers = set(straggler_ids)
         for row, client in enumerate(clients):
             if client.id in stragglers:
                 matrix[row] = self.get_compensated_gradient(client.id, matrix[row])
-        weights = np.asarray([client.num_train_samples for client in clients], dtype=np.float64)
-        return np.nan_to_num(np.average(matrix, axis=0, weights=weights), nan=0.0)
+
+        sample_counts = np.array([c.num_train_samples for c in clients], dtype=np.float64)
+        cluster_sum_grad = np.sum(matrix * sample_counts[:, None], axis=0)
+        total_samples = int(np.sum(sample_counts))
+        return np.nan_to_num(cluster_sum_grad, nan=0.0), total_samples
 
     def ota_to_lbs(self, aggregated_grad):
         gradient = np.asarray(aggregated_grad)

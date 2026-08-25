@@ -12,11 +12,10 @@ def execute_experiment(algo_name, config, run_func, history_path=None):
     config['algo_name'] = algo_name
     logger = ExperimentLogger(config)
 
-    if history_path:
-        if os.path.exists(history_path):
-            print(f"[{algo_name}] 加载历史数据: {history_path}")
-            with open(history_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
+    if history_path and os.path.exists(history_path):
+        print(f"[{algo_name}] 加载历史数据: {history_path}")
+        with open(history_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
 
     if config.get('use_cache', False):
         cached_data = logger.check_existing_data()
