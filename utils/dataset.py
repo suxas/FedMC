@@ -1,8 +1,63 @@
 import random
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import Dataset, DataLoader, Subset
 from torchvision import datasets, transforms
+CIFAR100_COARSE_CLASSES = [
+    'aquatic mammals', 'fish', 'flowers', 'food containers', 'fruit and vegetables',
+    'household electrical devices', 'household furniture', 'insects', 'large carnivores',
+    'large man-made outdoor things', 'large natural outdoor scenes', 'large omnivores and herbivores',
+    'medium-sized mammals', 'non-insect invertebrates', 'people', 'reptiles', 'small mammals',
+    'trees', 'vehicles 1', 'vehicles 2'
+]
+
+CIFAR100_FINE_CLASSES = [
+    'apple', 'aquarium_fish', 'baby', 'bear', 'beaver', 'bed', 'bee', 'beetle', 'bicycle', 'bottle',
+    'bowl', 'boy', 'bridge', 'bus', 'butterfly', 'camel', 'can', 'castle', 'caterpillar', 'cattle',
+    'chair', 'chimpanzee', 'clock', 'cloud', 'cockroach', 'couch', 'crab', 'crocodile', 'cup', 'dinosaur',
+    'dolphin', 'elephant', 'flatfish', 'forest', 'fox', 'girl', 'hamster', 'house', 'kangaroo', 'keyboard',
+    'lamp', 'lawn_mower', 'leopard', 'lion', 'lizard', 'lobster', 'man', 'maple_tree', 'motorcycle', 'mountain',
+    'mouse', 'mushroom', 'oak_tree', 'orange', 'orchid', 'otter', 'palm_tree', 'pear', 'pickup_truck', 'pine_tree',
+    'plain', 'plate', 'poppy', 'porcupine', 'possum', 'rabbit', 'raccoon', 'ray', 'road', 'rocket',
+    'rose', 'sea', 'seal', 'shark', 'shrew', 'skunk', 'skyscraper', 'snail', 'snake', 'spider',
+    'squirrel', 'streetcar', 'sunflower', 'sweet_pepper', 'table', 'tank', 'telephone', 'television', 'tiger', 'tractor',
+    'train', 'trout', 'tulip', 'turtle', 'wardrobe', 'whale', 'willow_tree', 'wolf', 'woman', 'worm'
+]
+
+
+class MultimodalCIFAR100(Dataset):
+    """Multimodal-CIFAR100: 图像模态 + 文本 Prompt 模态"""
+    def __init__(self, root="./data", train=True, transform=None, seq_len=16):
+        self.cifar = datasets.CIFAR100(root=root, train=train, download=True)
+        self.transform = transform
+        self.seq_len = seq_len
+        self.targets = self.cifar.targets
+
+        self.vocab = {"<PAD>": 0, "<UNK>": 1}
+        for name in CIFAR100_FINE_CLASSES + CIFAR100_COARSE_CLASSES:
+            for word in name.replace('_', ' ').split():
+                if word not in self.vocab:
+                    self.vocab[word] = len(self.vocab)
+
+        self.class_text_tokens = {}
+        for fine_idx, fine_name in enumerate(CIFAR100_FINE_CLASSES):
+            coarse_idx = fine_idx // 5
+            coarse_name = CIFAR100_COARSE_CLASSES[coarse_idx]
+            desc = f"a photo of {fine_name.replace('_', ' ')} a type of {coarse_name}"
+            tokens = [self.vocab.get(w, 1) for w in desc.split()][:seq_len]
+            if len(tokens) < seq_len:
+                tokens = tokens + [0] * (seq_len - len(tokens))
+            self.class_text_tokens[fine_idx] = torch.tensor(tokens, dtype=torch.long)
+
+    def __len__(self):
+        return len(self.cifar)
+
+    def __getitem__(self, idx):
+        img, target = self.cifar[idx]
+        if self.transform is not None:
+            img = self.transform(img)
+        text_tokens = self.class_text_tokens[target]
+        return (img, text_tokens), target
 
 
 def split_data_dmfl(targets, num_sbs, clients_per_sbs, inner_client_iid, rng=None):
@@ -41,7 +96,6 @@ def split_data_dmfl(targets, num_sbs, clients_per_sbs, inner_client_iid, rng=Non
 
 
 def get_dataloaders(config):
-    ds_name = config["dataset"]
     seed = int(config.get("seed", 42))
     np_rng = np.random.default_rng(seed)
     random.seed(seed)
@@ -50,35 +104,21 @@ def get_dataloaders(config):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    if ds_name == "FashionMNIST":
-        train_transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5])
-        ])
-        test_transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5])
-        ])
-        train_ds = datasets.FashionMNIST("./data", train=True, download=True, transform=train_transform)
-        test_ds = datasets.FashionMNIST("./data", train=False, download=True, transform=test_transform)
-        num_classes = 10
-    elif ds_name == "CIFAR10":
-        # CIFAR10 增加标准数据增强，测试集保持不变
-        train_transform = transforms.Compose([
-            transforms.RandomCrop(32, padding=4),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize([0.4914, 0.4822, 0.4465], [0.2023, 0.1994, 0.2010])
-        ])
-        test_transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize([0.4914, 0.4822, 0.4465], [0.2023, 0.1994, 0.2010])
-        ])
-        train_ds = datasets.CIFAR10("./data", train=True, download=True, transform=train_transform)
-        test_ds = datasets.CIFAR10("./data", train=False, download=True, transform=test_transform)
-        num_classes = 10
-    else:
-        raise ValueError(f"Unsupported dataset: {ds_name}")
+    train_transform = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5071, 0.4867, 0.4408], [0.2675, 0.2565, 0.2761])
+    ])
+    test_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize([0.5071, 0.4867, 0.4408], [0.2675, 0.2565, 0.2761])
+    ])
+
+    seq_len = config.get("text_seq_len", 16)
+    train_ds = MultimodalCIFAR100(root="./data", train=True, transform=train_transform, seq_len=seq_len)
+    test_ds = MultimodalCIFAR100(root="./data", train=False, transform=test_transform, seq_len=seq_len)
+    num_classes = 100
 
     targets = np.asarray(train_ds.targets)
     inner_client_iid = config.get("inner_client_iid", 0.1)

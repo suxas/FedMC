@@ -3,7 +3,7 @@ import numpy as np
 
 
 class EdgeSBS:
-    """边缘基站 SBS：负责 LRMC 矩阵补全、历史动量融合及簇内聚合"""
+    """边缘基站 SBS：多模态骨干联合矩阵补全、动量融合与簇内聚合"""
 
     def __init__(self, sbs_id, config):
         self.id = sbs_id
@@ -154,7 +154,6 @@ class EdgeSBS:
         if lrmc_norm > 0 and history_norm > 0:
             cosine = float(np.dot(lrmc_gradient, historical) / (lrmc_norm * history_norm + 1e-12))
             confidence = max(0.0, cosine)
-            # 在高维网络下进行保底加权平滑
             alpha = self.compensation_weight * (0.5 + 0.5 * confidence)
             result = alpha * lrmc_gradient + (1.0 - alpha) * historical
             return result

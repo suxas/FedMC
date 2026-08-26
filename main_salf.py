@@ -30,7 +30,7 @@ def run_salf(config):
     straggler_ratio = config.get('straggler_ratio', 0.5)
 
     metric_acc, metric_loss = [], []
-    pbar = tqdm(range(config['global_rounds']), colour='blue', desc="[SALF]")
+    pbar = tqdm(range(config['global_rounds']), colour='blue', desc="[Multimodal SALF]")
 
     for round_idx in pbar:
         edge_updates = []

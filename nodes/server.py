@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 
 class CloudServer:
-    """云端全局服务器 (LBS)"""
+    """多模态云端全局服务器 (LBS)"""
 
     def __init__(self, config):
         self.config = config
@@ -39,10 +39,11 @@ class CloudServer:
         total_samples = 0
 
         with torch.no_grad():
-            for images, labels in test_loader:
+            for (images, texts), labels in test_loader:
                 images = images.to(device, non_blocking=True)
+                texts = texts.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True)
-                logits = model(images)
+                logits = model((images, texts))
                 total_loss += F.cross_entropy(logits, labels, reduction='sum').item()
                 correct += logits.argmax(dim=1).eq(labels).sum().item()
                 total_samples += labels.size(0)

@@ -19,7 +19,7 @@ def run_proposed(config):
     lbs = CloudServer(config)
 
     metric_acc, metric_loss = [], []
-    pbar = tqdm(range(config['global_rounds']), colour='green', desc="[Proposed LRMC-FL]")
+    pbar = tqdm(range(config['global_rounds']), colour='green', desc="[Multimodal LRMC-FL]")
 
     for round_idx in pbar:
         global_state_dict = lbs.broadcast_model(global_state_dict)

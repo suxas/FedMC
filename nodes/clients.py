@@ -7,7 +7,7 @@ from nodes.models import FederatedModel
 
 
 class ClientUE:
-    """联邦学习边缘客户端 (UAV)"""
+    """多模态联邦学习边缘客户端 (UAV/UE)"""
 
     def __init__(self, client_id, config, train_loader, test_loader, num_classes):
         self.id = client_id
@@ -15,7 +15,7 @@ class ClientUE:
         self.device = config["device"]
         self.train_loader = train_loader
         self.test_loader = test_loader
-        self.model = FederatedModel(config["dataset"], num_classes).to(self.device)
+        self.model = FederatedModel(config.get("dataset", "MultimodalCIFAR100"), num_classes).to(self.device)
         self.criterion = nn.CrossEntropyLoss()
 
     @property
@@ -23,7 +23,6 @@ class ClientUE:
         return len(self.train_loader.dataset)
 
     def _make_optimizer(self):
-        # 固定 0.01 学习率，集成 weight_decay 抑制高维参数漂移
         return torch.optim.SGD(
             self.model.parameters(),
             lr=self.config.get("local_lr", 0.01),
@@ -40,14 +39,15 @@ class ClientUE:
         total_loss = 0.0
         n_batches = 0
         for _ in range(self.config.get("local_epochs", 3)):
-            for images, labels in self.train_loader:
+            for (images, texts), labels in self.train_loader:
                 if len(labels) < 2:
                     continue
                 images = images.to(self.device, non_blocking=True)
+                texts = texts.to(self.device, non_blocking=True)
                 labels = labels.to(self.device, non_blocking=True)
                 optimizer.zero_grad(set_to_none=True)
 
-                logits = self.model(images)
+                logits = self.model((images, texts))
                 loss = self.criterion(logits, labels)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
@@ -69,7 +69,7 @@ class ClientUE:
 
         for name, value in initial.items():
             if value.is_floating_point():
-                is_head = ('fc' in name or 'classifier' in name)
+                is_head = ('classifier' in name or 'fc' in name)
                 if is_head and not head_found:
                     head_split_idx = sum(u.size for u in updates)
                     head_found = True
@@ -88,7 +88,7 @@ class ClientUE:
         freq = rng.uniform(1e9, 2e9)
         rate = rng.uniform(1e6, 5e6)
 
-        cycles_per_sample = 100
+        cycles_per_sample = 150
         n_samples = self.num_train_samples
         num_local_epochs = self.config.get("local_epochs", 3)
         t_cpu = (num_local_epochs * cycles_per_sample * n_samples) / freq

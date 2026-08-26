@@ -23,7 +23,7 @@ def execute_experiment(algo_name, config, run_func, history_path=None):
             print(f"[{algo_name}] 使用缓存数据")
             return cached_data
 
-    print(f"\n--- 开始执行: {algo_name} ({config['dataset']}) ---")
+    print(f"\n--- 开始执行多模态实验: {algo_name} ({config['dataset']}) ---")
     metrics = run_func(config)
 
     n_rounds = len(metrics.get('loss', []))
@@ -45,4 +45,4 @@ if __name__ == "__main__":
     results_db["SALF"] = execute_experiment("SALF", base_config.copy(), run_salf)
     results_db["Proposed"] = execute_experiment("Proposed", base_config.copy(), run_proposed)
 
-    plot_results(results_db)
+    plot_results(results_db, save_path="data/results/multimodal_comparison.png")

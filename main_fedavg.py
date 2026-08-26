@@ -17,7 +17,7 @@ def run_fedavg(config):
     lbs = CloudServer(config)
     straggler_ratio = config.get('straggler_ratio', 0.5)
     metric_acc, metric_loss = [], []
-    pbar = tqdm(range(config['global_rounds']), colour='red', desc="[FedAvg]")
+    pbar = tqdm(range(config['global_rounds']), colour='red', desc="[Multimodal FedAvg]")
 
     for round_idx in pbar:
         edge_updates = []
