@@ -54,7 +54,6 @@ class LyapunovOptimizer:
         return self.T_avg_target
 
     def compute_lrmc_time(self, K, d_bb, I_iter):
-        """计算 SBS 端执行多模态骨干 I_iter 次 LRMC 补全的计算耗时"""
         return I_iter * (self.kappa1 * (K ** 2) * d_bb + self.kappa2 * (K ** 3))
 
     def compute_error_bound(self, delta_m, I_iter, rho, alpha):
@@ -242,6 +241,7 @@ def plot_optimizer_trajectories(history, save_dir="data/results"):
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
 
+    # 1. 准确率收敛轨迹
     fig1, (ax1_1, ax1_2) = plt.subplots(1, 2, figsize=(14, 5.5))
     ax1_1.plot(rounds, acc, color='#1f77b4', lw=2.2, label='Test Accuracy')
     ax1_1.set_xlabel('Global Communication Rounds')
@@ -259,9 +259,14 @@ def plot_optimizer_trajectories(history, save_dir="data/results"):
 
     plt.tight_layout()
     acc_png_path = os.path.join(save_dir, f"trajectory_accuracy_{timestamp}.png")
+    acc_pdf_path = os.path.join(save_dir, f"trajectory_accuracy_{timestamp}.pdf")
+    acc_eps_path = os.path.join(save_dir, f"trajectory_accuracy_{timestamp}.eps")
     plt.savefig(acc_png_path, dpi=300, bbox_inches='tight')
+    plt.savefig(acc_pdf_path, dpi=300, bbox_inches='tight')
+    plt.savefig(acc_eps_path, dpi=300, bbox_inches='tight', format='eps')
     plt.close()
 
+    # 2. 动态时延跟踪与队列稳定性
     fig2, (ax2_1, ax2_2) = plt.subplots(1, 2, figsize=(14, 5.5))
     ax2_1.plot(rounds, round_latency, color='#e377c2', lw=1.5, alpha=0.6, label='Instant Latency $T^{(r)}$')
     if len(round_latency) >= 5:
@@ -285,10 +290,16 @@ def plot_optimizer_trajectories(history, save_dir="data/results"):
 
     plt.tight_layout()
     lat_png_path = os.path.join(save_dir, f"trajectory_latency_{timestamp}.png")
+    lat_pdf_path = os.path.join(save_dir, f"trajectory_latency_{timestamp}.pdf")
+    lat_eps_path = os.path.join(save_dir, f"trajectory_latency_{timestamp}.eps")
     plt.savefig(lat_png_path, dpi=300, bbox_inches='tight')
+    plt.savefig(lat_pdf_path, dpi=300, bbox_inches='tight')
+    plt.savefig(lat_eps_path, dpi=300, bbox_inches='tight', format='eps')
     plt.close()
 
-    print(f"\n[Optimizer] 轨迹图表保存成功:\n  - {acc_png_path}\n  - {lat_png_path}")
+    print(f"\n[Optimizer] 轨迹图表已同步保存为 PNG, PDF 与 EPS 格式:")
+    print(f"  - {acc_png_path} | {acc_pdf_path} | {acc_eps_path}")
+    print(f"  - {lat_png_path} | {lat_pdf_path} | {lat_eps_path}")
 
 
 if __name__ == "__main__":

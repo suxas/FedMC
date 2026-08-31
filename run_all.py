@@ -3,6 +3,7 @@ import json
 from config import get_base_config
 from main import run_proposed
 from main_fedavg import run_fedavg
+from main_fedprox import run_fedprox
 from main_salf import run_salf
 from utils.logger import ExperimentLogger
 from utils.plotter import plot_results
@@ -42,6 +43,7 @@ if __name__ == "__main__":
     results_db = {}
 
     results_db["FedAvg"] = execute_experiment("FedAvg", base_config.copy(), run_fedavg)
+    results_db["FedProx"] = execute_experiment("FedProx", base_config.copy(), run_fedprox)
     results_db["SALF"] = execute_experiment("SALF", base_config.copy(), run_salf)
     results_db["Proposed"] = execute_experiment("Proposed", base_config.copy(), run_proposed)
 

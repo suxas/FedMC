@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 
 class VisualEncoder(nn.Module):
-    """轻量级视觉特征提取器 (3x32x32 -> 128维特征)"""
+    """自适应轻量级视觉特征提取器 (支持 32x32 和 64x64 输入)"""
     def __init__(self, in_channels=3, out_dim=128):
         super().__init__()
         self.conv = nn.Sequential(
@@ -32,8 +32,8 @@ class VisualEncoder(nn.Module):
 
 
 class TextEncoder(nn.Module):
-    """轻量级文本特征提取器 (Token序列 -> 128维特征)"""
-    def __init__(self, vocab_size=500, embed_dim=64, out_dim=128):
+    """自适应轻量级文本特征提取器 (Token序列 -> 128维特征)"""
+    def __init__(self, vocab_size=1000, embed_dim=64, out_dim=128):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim)
         self.conv1d = nn.Sequential(
@@ -52,7 +52,7 @@ class TextEncoder(nn.Module):
 
 class MultimodalFederatedModel(nn.Module):
     """多模态联合模型：视觉骨干 + 文本骨干 + 融合分类头"""
-    def __init__(self, num_classes=100, vocab_size=500, feature_dim=128):
+    def __init__(self, num_classes=100, vocab_size=1000, feature_dim=128):
         super().__init__()
         self.visual_encoder = VisualEncoder(in_channels=3, out_dim=feature_dim)
         self.text_encoder = TextEncoder(vocab_size=vocab_size, embed_dim=64, out_dim=feature_dim)
@@ -76,7 +76,8 @@ class FederatedModel(nn.Module):
     """统一模型入口"""
     def __init__(self, dataset="MultimodalCIFAR100", num_classes=100):
         super().__init__()
-        self.model = MultimodalFederatedModel(num_classes=num_classes)
+        vocab_size = 1000 if "TinyImageNet" in dataset else 500
+        self.model = MultimodalFederatedModel(num_classes=num_classes, vocab_size=vocab_size)
 
     def forward(self, inputs):
         return self.model(inputs)

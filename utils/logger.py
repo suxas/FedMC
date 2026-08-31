@@ -14,18 +14,15 @@ class ExperimentLogger:
         self.algo_name = config.get('algo_name', 'Unknown_Algo')
         self.rounds = config.get('global_rounds', 0)
 
-        # 创建算法专属目录
         self.algo_dir = os.path.join(self.base_dir, self.algo_name)
         os.makedirs(self.algo_dir, exist_ok=True)
 
-        # 计算配置哈希（排除不影响结果的参数）
         hash_config = copy.deepcopy(config)
         hash_config.pop('use_cache', None)
         hash_config.pop('device', None)
         self.config_hash = hashlib.md5(json.dumps(hash_config, sort_keys=True).encode('utf-8')).hexdigest()
 
     def check_existing_data(self):
-        """查找哈希匹配的缓存数据"""
         if not os.path.exists(self.algo_dir):
             return None
 
@@ -42,7 +39,6 @@ class ExperimentLogger:
         return None
 
     def save_data(self, data):
-        """保存实验数据，文件名包含轮数和时间戳"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filepath = os.path.join(self.algo_dir, f"{self.rounds}_{timestamp}.json")
 

@@ -7,7 +7,7 @@ from nodes.models import FederatedModel
 
 
 class ClientUE:
-    """多模态联邦学习边缘客户端 (UAV/UE)"""
+    """多模态联邦学习边缘客户端 (UAV/UE，支持常规训练与 FedProx 近端正则化)"""
 
     def __init__(self, client_id, config, train_loader, test_loader, num_classes):
         self.id = client_id
@@ -33,12 +33,14 @@ class ClientUE:
     def set_global_features(self, global_state):
         self.model.load_state_dict(global_state, strict=True)
 
-    def _train_epoch(self):
+    def _train_epoch(self, global_params_dict=None, mu=0.0, epochs=None):
         self.model.train()
         optimizer = self._make_optimizer()
         total_loss = 0.0
         n_batches = 0
-        for _ in range(self.config.get("local_epochs", 3)):
+        num_epochs = epochs if epochs is not None else self.config.get("local_epochs", 3)
+
+        for _ in range(num_epochs):
             for (images, texts), labels in self.train_loader:
                 if len(labels) < 2:
                     continue
@@ -49,6 +51,16 @@ class ClientUE:
 
                 logits = self.model((images, texts))
                 loss = self.criterion(logits, labels)
+
+                # FedProx 近端正则项支持
+                if mu > 0.0 and global_params_dict is not None:
+                    prox_loss = 0.0
+                    for name, param in self.model.named_parameters():
+                        if name in global_params_dict:
+                            g_param = global_params_dict[name].to(self.device)
+                            prox_loss += torch.norm(param - g_param) ** 2
+                    loss = loss + 0.5 * mu * prox_loss
+
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
                 optimizer.step()
@@ -57,10 +69,10 @@ class ClientUE:
                 n_batches += 1
         return total_loss / max(n_batches, 1)
 
-    def local_train(self, global_state):
+    def local_train(self, global_state, mu=0.0, epochs=None):
         self.set_global_features(global_state)
         initial = {name: value.detach().clone() for name, value in global_state.items()}
-        self._train_epoch()
+        self._train_epoch(global_params_dict=initial, mu=mu, epochs=epochs)
         current = self.model.state_dict()
 
         updates = []

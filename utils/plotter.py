@@ -16,11 +16,11 @@ def setup_plot_style(font_family='Times New Roman', font_size=14):
 
 def plot_results(results_dict, save_path="data/results/comparison.png",
                  font_family='Times New Roman', font_size=14, markers=None, lines=None):
-    """绘制算法对比图并保存 PNG 和 PDF（分类任务：1x2 Loss + Acc）"""
+    """绘制算法对比图并同步保存 PNG、PDF 与 EPS 格式"""
     if markers is None:
-        markers = ['o', 's', '^', 'D']
+        markers = ['o', 's', '^', 'D', 'v', 'p']
     if lines is None:
-        lines = ['-', '--', '-.', ':']
+        lines = ['-', '--', '-.', ':', '-', '--']
 
     setup_plot_style(font_family=font_family, font_size=font_size)
 
@@ -51,22 +51,22 @@ def plot_results(results_dict, save_path="data/results/comparison.png",
         ax.legend(loc=loc, framealpha=0.95)
         ax.grid(True, linestyle='--', alpha=0.6)
 
-    # 保存
+    # 路径与格式解析
     base_dir = os.path.dirname(save_path)
     base_name = os.path.basename(save_path)
-    name_without_ext, ext = os.path.splitext(base_name)
+    name_without_ext, _ = os.path.splitext(base_name)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    png_path = os.path.join(base_dir,
-                            f"{name_without_ext}_{timestamp}.png") if base_dir else f"{name_without_ext}_{timestamp}.png"
-    pdf_path = os.path.join(base_dir,
-                            f"{name_without_ext}_{timestamp}.pdf") if base_dir else f"{name_without_ext}_{timestamp}.pdf"
+    png_path = os.path.join(base_dir, f"{name_without_ext}_{timestamp}.png") if base_dir else f"{name_without_ext}_{timestamp}.png"
+    pdf_path = os.path.join(base_dir, f"{name_without_ext}_{timestamp}.pdf") if base_dir else f"{name_without_ext}_{timestamp}.pdf"
+    eps_path = os.path.join(base_dir, f"{name_without_ext}_{timestamp}.eps") if base_dir else f"{name_without_ext}_{timestamp}.eps"
 
     if base_dir:
         os.makedirs(base_dir, exist_ok=True)
 
     plt.savefig(png_path, dpi=300, bbox_inches='tight')
     plt.savefig(pdf_path, dpi=300, bbox_inches='tight')
+    plt.savefig(eps_path, dpi=300, bbox_inches='tight', format='eps')
     plt.close()
 
-    print(f"\n[Plotter] 绘图已保存至:\n  - {png_path}\n  - {pdf_path}")
+    print(f"\n[Plotter] 绘图已同步保存至:\n  - PNG: {png_path}\n  - PDF: {pdf_path}\n  - EPS: {eps_path}")
