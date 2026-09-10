@@ -4,17 +4,13 @@ import os
 import copy
 from datetime import datetime
 
-
 class ExperimentLogger:
-    """实验日志记录器：支持缓存机制，通过配置哈希避免重复运行"""
-
-    def __init__(self, config, base_dir="data/results"):
+    def __init__(self, config, base_dir="result"):
         self.config = config
         self.base_dir = base_dir
         self.algo_name = config.get('algo_name', 'Unknown_Algo')
         self.rounds = config.get('global_rounds', 0)
-
-        self.algo_dir = os.path.join(self.base_dir, self.algo_name)
+        self.algo_dir = os.path.join(self.base_dir, "logs", self.algo_name)
         os.makedirs(self.algo_dir, exist_ok=True)
 
         hash_config = copy.deepcopy(config)
@@ -25,7 +21,6 @@ class ExperimentLogger:
     def check_existing_data(self):
         if not os.path.exists(self.algo_dir):
             return None
-
         for filename in os.listdir(self.algo_dir):
             if filename.endswith(".json"):
                 filepath = os.path.join(self.algo_dir, filename)
@@ -41,9 +36,7 @@ class ExperimentLogger:
     def save_data(self, data):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filepath = os.path.join(self.algo_dir, f"{self.rounds}_{timestamp}.json")
-
         data["config_hash"] = self.config_hash
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=4)
-
-        print(f"[Logger] 实验数据已存入: {filepath}")
+        print(f"[Logger] 实验结果已保存: {filepath}")

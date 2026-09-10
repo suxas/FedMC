@@ -3,10 +3,7 @@ import time
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-
 import torch
-import torch.nn.functional as F
-
 from config import get_base_config
 from nodes.clients import ClientUE
 from nodes.models import FederatedModel
@@ -15,40 +12,31 @@ from nodes.server import CloudServer
 from utils.dataset import get_dataloaders
 from utils.plotter import setup_plot_style
 
-
 class LyapunovOptimizer:
-    """基于李雅普诺夫动态控制的多模态 LRMC-FL 精度-时延联合自适应优化器"""
-
     def __init__(self, config, T_avg_target=None, V=25.0):
         self.config = config
         self.T_avg_target = T_avg_target
         self.V = float(V)
         self.Q = 0.0
 
-        # 硬件与时延常数标定
         self.kappa1 = 1.5e-8
         self.kappa2 = 2.0e-6
         self.T_OTA = 0.05
 
-        # 误差模型先验常数
         self.C1 = 0.8
         self.C2 = 1.2
         self.mu = 0.85
         self.sigma_drift_sq = 0.35
         self.sigma_lrmc_sq = 0.15
 
-        # 决策边界约束
         self.I_min = 5
         self.I_max = 30
-        self.rho_max = config.get("lrmc_rank_ratio", 0.8)
+        self.rho_max = config.get("lrmc_rank_ratio_max", 0.95)
 
     def calibrate_target_latency(self, sample_times_matrix, compression_ratio=0.90):
         if self.T_avg_target is not None:
             return self.T_avg_target
-
-        natural_latencies = []
-        for cluster_times in sample_times_matrix:
-            natural_latencies.append(max(cluster_times))
+        natural_latencies = [max(cluster_times) for cluster_times in sample_times_matrix]
         base_latency = max(natural_latencies) + self.T_OTA + 0.02
         self.T_avg_target = float(base_latency * compression_ratio)
         return self.T_avg_target
@@ -70,8 +58,8 @@ class LyapunovOptimizer:
             0.0, 1.0
         ))
         rho_star = self.rho_max
-
         sorted_times = sorted(client_times)
+
         best_obj = float('inf')
         best_tau = sorted_times[-1]
         best_I = self.I_min
@@ -79,12 +67,10 @@ class LyapunovOptimizer:
         for k_idx, tau_candidate in enumerate(sorted_times):
             stragglers_count = K - (k_idx + 1)
             delta_m = stragglers_count / float(K)
-
             for I_candidate in range(self.I_min, self.I_max + 1, 5):
                 t_lrmc = self.compute_lrmc_time(K, d_bb, I_candidate)
                 t_total_sbs = tau_candidate + t_lrmc + self.T_OTA
                 err_bound = self.compute_error_bound(delta_m, I_candidate, rho_star, alpha_star)
-
                 obj_val = self.V * err_bound + self.Q * t_total_sbs
 
                 if obj_val < best_obj:
@@ -98,21 +84,19 @@ class LyapunovOptimizer:
         self.Q = max(0.0, self.Q + actual_round_latency - self.T_avg_target)
         return self.Q
 
-
 def run_lyapunov_proposed(config, target_latency=None, weight_v=25.0):
     train_loaders, test_loader, num_classes = get_dataloaders(config)
     global_model = FederatedModel(config['dataset'], num_classes).to(config['device'])
     global_state_dict = global_model.state_dict()
-
     K = config['clients_per_sbs']
     num_sbs = config['num_sbs']
+
     clients = [
         ClientUE(i, config, train_loaders[i], None, num_classes)
         for i in range(num_sbs * K)
     ]
     sbs_list = [EdgeSBS(sbs_id, config) for sbs_id in range(num_sbs)]
     lbs = CloudServer(config)
-
     controller = LyapunovOptimizer(config, T_avg_target=target_latency, V=weight_v)
 
     d_total = sum(p.numel() for p in global_model.parameters())
@@ -125,8 +109,6 @@ def run_lyapunov_proposed(config, target_latency=None, weight_v=25.0):
         s_idx, e_idx = sbs_id * K, (sbs_id + 1) * K
         sample_times.append([clients[i].simulate_communication_time(0)[1] for i in range(s_idx, e_idx)])
     active_target = controller.calibrate_target_latency(sample_times, compression_ratio=0.90)
-
-    print(f"[Multimodal Optimizer] 激活时延硬约束目标 T_avg_target: {active_target:.3f}s (多模态骨干维度: {d_bb})")
 
     history = {
         "rounds": [],
@@ -153,13 +135,12 @@ def run_lyapunov_proposed(config, target_latency=None, weight_v=25.0):
             start_idx = sbs_id * K
             end_idx = start_idx + K
             cluster_clients = clients[start_idx:end_idx]
-
             times = [c.simulate_communication_time(round_idx)[1] for c in cluster_clients]
+
             tau_star, I_star, rho_star, alpha_star = controller.solve_sbs_decision(sbs_id, times, K, d_bb)
             tau_list.append(tau_star)
 
             sbs.config["lrmc_max_iter"] = I_star
-            sbs.config["lrmc_rank_ratio"] = rho_star
             sbs.compensation_weight = alpha_star
 
             gradients, straggler_ids = [], []
@@ -187,7 +168,7 @@ def run_lyapunov_proposed(config, target_latency=None, weight_v=25.0):
                 if g is not None:
                     grad_matrix[row] = g
 
-            completed_matrix = sbs.lrmc_complete(grad_matrix)
+            completed_matrix = sbs.lrmc_complete(grad_matrix, round_idx=round_idx)
             cluster_sum_grad, sbs_samples = sbs.intra_cluster_aggregate(
                 completed_matrix, straggler_ids, cluster_clients
             )
@@ -206,7 +187,9 @@ def run_lyapunov_proposed(config, target_latency=None, weight_v=25.0):
         cumulative_time += round_latency
         current_Q = controller.update_virtual_queue(round_latency)
 
-        acc, loss = lbs.evaluate(global_state_dict, test_loader, global_model, config['device'])
+        eval_res = lbs.evaluate(global_state_dict, test_loader, global_model, config['device'])
+        acc = eval_res['top1']
+        loss = eval_res['loss']
 
         history["rounds"].append(round_idx + 1)
         history["acc"].append(acc)
@@ -226,22 +209,21 @@ def run_lyapunov_proposed(config, target_latency=None, weight_v=25.0):
 
     return history
 
+def plot_optimizer_trajectories(history, save_dir="result"):
+    png_dir = os.path.join(save_dir, "png")
+    pdf_dir = os.path.join(save_dir, "pdf")
+    os.makedirs(png_dir, exist_ok=True)
+    os.makedirs(pdf_dir, exist_ok=True)
 
-def plot_optimizer_trajectories(history, save_dir="data/results"):
-    os.makedirs(save_dir, exist_ok=True)
     setup_plot_style(font_family='Times New Roman', font_size=14)
-
     rounds = history["rounds"]
     acc = history["acc"]
-    loss = history["loss"]
     round_latency = history["round_latency"]
     cum_latency = history["cum_latency"]
     queue_Q = history["queue_Q"]
     target_latency = history["target_latency"]
-
     timestamp = time.strftime("%Y%m%d_%H%M%S")
 
-    # 1. 准确率收敛轨迹
     fig1, (ax1_1, ax1_2) = plt.subplots(1, 2, figsize=(14, 5.5))
     ax1_1.plot(rounds, acc, color='#1f77b4', lw=2.2, label='Test Accuracy')
     ax1_1.set_xlabel('Global Communication Rounds')
@@ -256,19 +238,14 @@ def plot_optimizer_trajectories(history, save_dir="data/results"):
     ax1_2.set_title('Test Accuracy vs. Cumulative Latency')
     ax1_2.grid(True, linestyle='--', alpha=0.5)
     ax1_2.legend(loc='lower right')
-
     plt.tight_layout()
-    acc_png_path = os.path.join(save_dir, f"trajectory_accuracy_{timestamp}.png")
-    acc_pdf_path = os.path.join(save_dir, f"trajectory_accuracy_{timestamp}.pdf")
-    acc_eps_path = os.path.join(save_dir, f"trajectory_accuracy_{timestamp}.eps")
-    plt.savefig(acc_png_path, dpi=300, bbox_inches='tight')
-    plt.savefig(acc_pdf_path, dpi=300, bbox_inches='tight')
-    plt.savefig(acc_eps_path, dpi=300, bbox_inches='tight', format='eps')
+
+    plt.savefig(os.path.join(png_dir, f"trajectory_accuracy_{timestamp}.png"), dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(pdf_dir, f"trajectory_accuracy_{timestamp}.pdf"), dpi=300, bbox_inches='tight')
     plt.close()
 
-    # 2. 动态时延跟踪与队列稳定性
     fig2, (ax2_1, ax2_2) = plt.subplots(1, 2, figsize=(14, 5.5))
-    ax2_1.plot(rounds, round_latency, color='#e377c2', lw=1.5, alpha=0.6, label='Instant Latency $T^{(r)}$')
+    ax2_1.plot(rounds, round_latency, color='#e377c2', lw=1.5, alpha=0.5, label='Instant Latency $T^{(r)}$')
     if len(round_latency) >= 5:
         window = min(10, len(round_latency))
         ma_latency = np.convolve(round_latency, np.ones(window) / window, mode='valid')
@@ -287,25 +264,13 @@ def plot_optimizer_trajectories(history, save_dir="data/results"):
     ax2_2.set_title('Lyapunov Virtual Queue Stability')
     ax2_2.grid(True, linestyle='--', alpha=0.5)
     ax2_2.legend(loc='upper right')
-
     plt.tight_layout()
-    lat_png_path = os.path.join(save_dir, f"trajectory_latency_{timestamp}.png")
-    lat_pdf_path = os.path.join(save_dir, f"trajectory_latency_{timestamp}.pdf")
-    lat_eps_path = os.path.join(save_dir, f"trajectory_latency_{timestamp}.eps")
-    plt.savefig(lat_png_path, dpi=300, bbox_inches='tight')
-    plt.savefig(lat_pdf_path, dpi=300, bbox_inches='tight')
-    plt.savefig(lat_eps_path, dpi=300, bbox_inches='tight', format='eps')
+
+    plt.savefig(os.path.join(png_dir, f"trajectory_latency_{timestamp}.png"), dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(pdf_dir, f"trajectory_latency_{timestamp}.pdf"), dpi=300, bbox_inches='tight')
     plt.close()
 
-    print(f"\n[Optimizer] 轨迹图表已同步保存为 PNG, PDF 与 EPS 格式:")
-    print(f"  - {acc_png_path} | {acc_pdf_path} | {acc_eps_path}")
-    print(f"  - {lat_png_path} | {lat_pdf_path} | {lat_eps_path}")
-
-
 if __name__ == "__main__":
-    config = get_base_config()
-    WEIGHT_V = 25.0
-    TARGET_LATENCY = None
-
-    history = run_lyapunov_proposed(config, target_latency=TARGET_LATENCY, weight_v=WEIGHT_V)
-    plot_optimizer_trajectories(history, save_dir="data/results")
+    base_cfg = get_base_config()
+    hist = run_lyapunov_proposed(base_cfg, target_latency=None, weight_v=25.0)
+    plot_optimizer_trajectories(hist, save_dir="result")

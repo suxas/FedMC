@@ -1,72 +1,153 @@
-import matplotlib.pyplot as plt
 import os
 from datetime import datetime
-
+import numpy as np
+import matplotlib.pyplot as plt
 
 def setup_plot_style(font_family='Times New Roman', font_size=14):
-    """配置学术论文图表风格"""
     plt.rcParams.update({
-        'font.family': 'serif', 'font.serif': [font_family], 'font.size': font_size,
-        'axes.labelsize': font_size + 2, 'axes.titlesize': font_size + 2,
-        'legend.fontsize': font_size - 2, 'xtick.labelsize': font_size, 'ytick.labelsize': font_size,
-        'lines.linewidth': 2.5, 'lines.markersize': 8, 'figure.autolayout': True,
+        'font.family': 'serif',
+        'font.serif': [font_family, 'DejaVu Serif', 'Times New Roman'],
+        'font.size': font_size,
+        'axes.labelsize': font_size + 2,
+        'axes.titlesize': font_size + 2,
+        'legend.fontsize': font_size - 2,
+        'xtick.labelsize': font_size,
+        'ytick.labelsize': font_size,
+        'lines.linewidth': 2.4,
+        'lines.markersize': 6.5,
+        'figure.autolayout': True,
         'axes.unicode_minus': False
     })
 
+def smooth_curve(points, factor=0.88):
+    if len(points) <= 3:
+        return np.asarray(points, dtype=np.float64)
+    points = np.asarray(points, dtype=np.float64)
+    smoothed = np.empty_like(points)
+    weight = 0.0
+    accum = 0.0
+    for i, val in enumerate(points):
+        weight = weight * factor + (1.0 - factor)
+        accum = accum * factor + (1.0 - factor) * val
+        smoothed[i] = accum / max(weight, 1e-8)
+    return smoothed
 
-def plot_results(results_dict, save_path="data/results/comparison.png",
+def plot_results(results_dict, save_path="result/multimodal_comparison.png",
                  font_family='Times New Roman', font_size=14, markers=None, lines=None):
-    """绘制算法对比图并同步保存 PNG、PDF 与 EPS 格式"""
     if markers is None:
-        markers = ['o', 's', '^', 'D', 'v', 'p']
+        markers = ['o', 's', '^', 'D', 'v', 'p', 'X', '*']
     if lines is None:
-        lines = ['-', '--', '-.', ':', '-', '--']
+        lines = ['-', '--', '-.', ':', '-', '--', '-.', ':']
 
+    palette = ['#d62728', '#9467bd', '#ff7f0e', '#bcbd22', '#2ca02c', '#1f77b4']
     setup_plot_style(font_family=font_family, font_size=font_size)
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    base_dir = "result"
+    png_dir = os.path.join(base_dir, "png")
+    pdf_dir = os.path.join(base_dir, "pdf")
+    os.makedirs(png_dir, exist_ok=True)
+    os.makedirs(pdf_dir, exist_ok=True)
 
-    for i, (algo_name, data) in enumerate(results_dict.items()):
-        loss_data = data.get('loss', data.get('Loss', []))
-        acc_data = data.get('acc', data.get('Acc', []))
-        rounds = data.get('rounds', list(range(1, len(loss_data) + 1)))
-        markevery = max(1, len(rounds) // 10)
-
-        ax1.plot(rounds, loss_data, label=algo_name,
-                 marker=markers[i % len(markers)], linestyle=lines[i % len(lines)],
-                 markevery=markevery, alpha=0.85)
-        ax2.plot(rounds, acc_data, label=algo_name,
-                 marker=markers[i % len(markers)], linestyle=lines[i % len(lines)],
-                 markevery=markevery, alpha=0.85)
-
-    axes_config = [
-        (ax1, 'Global Communication Rounds', 'Test Loss', 'Test Loss', 'upper right'),
-        (ax2, 'Global Communication Rounds', 'Accuracy (%)', 'Test Accuracy', 'lower right'),
-    ]
-
-    for ax, xlabel, ylabel, title, loc in axes_config:
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel(ylabel)
-        ax.set_title(title)
-        ax.legend(loc=loc, framealpha=0.95)
-        ax.grid(True, linestyle='--', alpha=0.6)
-
-    # 路径与格式解析
-    base_dir = os.path.dirname(save_path)
     base_name = os.path.basename(save_path)
     name_without_ext, _ = os.path.splitext(base_name)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    png_path = os.path.join(base_dir, f"{name_without_ext}_{timestamp}.png") if base_dir else f"{name_without_ext}_{timestamp}.png"
-    pdf_path = os.path.join(base_dir, f"{name_without_ext}_{timestamp}.pdf") if base_dir else f"{name_without_ext}_{timestamp}.pdf"
-    eps_path = os.path.join(base_dir, f"{name_without_ext}_{timestamp}.eps") if base_dir else f"{name_without_ext}_{timestamp}.eps"
+    metric_configs = [
+        {
+            "keys": ["top1", "acc", "Top1", "Acc"],
+            "ylabel": "Top-1 Accuracy (%)",
+            "title": "Top-1 Accuracy vs. Communication Rounds",
+            "tag": "top1_accuracy",
+            "legend_loc": "lower right"
+        },
+        {
+            "keys": ["top5", "Top5"],
+            "ylabel": "Top-5 Accuracy (%)",
+            "title": "Top-5 Accuracy vs. Communication Rounds",
+            "tag": "top5_accuracy",
+            "legend_loc": "lower right"
+        },
+        {
+            "keys": ["f1", "macro_f1", "F1"],
+            "ylabel": "Macro-F1 Score (%)",
+            "title": "Macro-F1 Score vs. Communication Rounds",
+            "tag": "macro_f1",
+            "legend_loc": "lower right"
+        },
+        {
+            "keys": ["loss", "Loss"],
+            "ylabel": "Test Loss",
+            "title": "Test Loss vs. Communication Rounds",
+            "tag": "test_loss",
+            "legend_loc": "upper right"
+        }
+    ]
 
-    if base_dir:
-        os.makedirs(base_dir, exist_ok=True)
+    saved_files = []
 
-    plt.savefig(png_path, dpi=300, bbox_inches='tight')
-    plt.savefig(pdf_path, dpi=300, bbox_inches='tight')
-    plt.savefig(eps_path, dpi=300, bbox_inches='tight', format='eps')
-    plt.close()
+    for m_cfg in metric_configs:
+        has_metric = False
+        for algo_data in results_dict.values():
+            if any(k in algo_data for k in m_cfg["keys"]):
+                has_metric = True
+                break
+        if not has_metric:
+            continue
 
-    print(f"\n[Plotter] 绘图已同步保存至:\n  - PNG: {png_path}\n  - PDF: {pdf_path}\n  - EPS: {eps_path}")
+        fig, ax = plt.subplots(1, 1, figsize=(8.5, 6))
+
+        for i, (algo_name, data) in enumerate(results_dict.items()):
+            metric_series = None
+            for k in m_cfg["keys"]:
+                if k in data and len(data[k]) > 0:
+                    metric_series = data[k]
+                    break
+            if metric_series is None:
+                continue
+
+            raw_y = np.asarray(metric_series, dtype=np.float64)
+            rounds = np.asarray(data.get('rounds', list(range(1, len(raw_y) + 1))), dtype=np.float64)
+            color = palette[i % len(palette)]
+            markevery = max(1, len(rounds) // 12)
+
+            smooth_y = smooth_curve(raw_y, factor=0.88)
+
+            # 1. 原始波动细线
+            ax.plot(rounds, raw_y, color=color, alpha=0.22, linewidth=1.0, zorder=2)
+            # 2. 阴影区间
+            ax.fill_between(rounds, raw_y, smooth_y, color=color, alpha=0.14, zorder=1)
+            # 3. EMA 平滑主体曲线
+            ax.plot(
+                rounds, smooth_y,
+                label=algo_name,
+                color=color,
+                linestyle=lines[i % len(lines)],
+                marker=markers[i % len(markers)],
+                markevery=markevery,
+                linewidth=2.4,
+                zorder=3
+            )
+
+        ax.set_xlabel("Global Communication Rounds")
+        ax.set_ylabel(m_cfg["ylabel"])
+        ax.set_title(m_cfg["title"])
+        ax.legend(loc=m_cfg["legend_loc"], framealpha=0.92, facecolor='white', edgecolor='none')
+        ax.grid(True, linestyle='--', alpha=0.55)
+
+        file_prefix = f"{name_without_ext}_{m_cfg['tag']}"
+        png_path = os.path.join(png_dir, f"{file_prefix}_{timestamp}.png")
+        latest_png = os.path.join(png_dir, f"{file_prefix}_latest.png")
+        pdf_path = os.path.join(pdf_dir, f"{file_prefix}_{timestamp}.pdf")
+        latest_pdf = os.path.join(pdf_dir, f"{file_prefix}_latest.pdf")
+
+        plt.savefig(png_path, dpi=300, bbox_inches='tight')
+        plt.savefig(latest_png, dpi=300, bbox_inches='tight')
+        plt.savefig(pdf_path, dpi=300, bbox_inches='tight')
+        plt.savefig(latest_pdf, dpi=300, bbox_inches='tight')
+        plt.close(fig)
+
+        saved_files.append((m_cfg["ylabel"], png_path, pdf_path))
+
+    print(f"\n[Plotter] 图像成功保存:")
+    for label, png_f, pdf_f in saved_files:
+        print(f"  - [{label}]:\n      PNG: {png_f}\n      PDF: {pdf_f}")
