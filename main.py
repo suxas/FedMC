@@ -23,7 +23,7 @@ def run_proposed(config, train_loaders=None, test_loader=None, num_classes=None,
     lbs = CloudServer(config)
 
     metric_loss, metric_top1, metric_top5, metric_f1 = [], [], [], []
-    pbar = tqdm(range(config['global_rounds']), colour='green', desc="[Multimodal LRMC-FL]")
+    pbar = tqdm(range(config['global_rounds']), colour='green', desc="[UAV Multimodal Proposed-FL]")
 
     for round_idx in pbar:
         global_state_dict = lbs.broadcast_model(global_state_dict)
@@ -34,11 +34,10 @@ def run_proposed(config, train_loaders=None, test_loader=None, num_classes=None,
             end_idx = start_idx + config['clients_per_sbs']
             cluster_clients = clients[start_idx:end_idx]
 
-            grad_matrix, straggler_ids, _ = sbs.collect_gradients(
+            delta_matrix, straggler_ids, _ = sbs.collect_gradients(
                 cluster_clients, global_state_dict, round_idx
             )
-            # 动态退火截断：传入当前轮次
-            completed_matrix = sbs.lrmc_complete(grad_matrix, round_idx=round_idx)
+            completed_matrix = sbs.lrmc_complete(delta_matrix, round_idx=round_idx)
             cluster_sum_grad, sbs_samples = sbs.intra_cluster_aggregate(
                 completed_matrix, straggler_ids, cluster_clients
             )

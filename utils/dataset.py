@@ -1,18 +1,72 @@
 import os
-from concurrent.futures import ThreadPoolExecutor
+import json
 import numpy as np
-import scipy.io
 import torch
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader, Subset
 from torchvision import transforms
 
-def build_vocab_from_texts(captions, vocab_size=2000):
-    vocab = {"<PAD>": 0, "<UNK>": 1}
+# 21 个地貌类别的直接泄漏实体词与近义词库
+LEAKY_KEYWORDS = {
+    # agricultural
+    "agricultural", "agriculture", "farmland", "cropland", "farm", "crop", "crops", "plantation",
+    # airplane
+    "airplane", "airplanes", "plane", "planes", "aircraft", "jet", "jets", "airliner",
+    # baseballdiamond
+    "baseball", "diamond", "ballfield",
+    # beach
+    "beach", "beaches", "seashore", "coastline", "shoreline", "sand", "sandy",
+    # buildings
+    "building", "buildings", "skyscraper", "skyscrapers", "house", "houses", "edifice",
+    # chaparral
+    "chaparral", "shrub", "shrubs", "shrubbery", "scrub", "scrubland", "brush",
+    # residential (dense, medium, sparse, mobile)
+    "residential", "neighborhood", "homes", "home", "mobilehome", "trailer", "trailers",
+    "dense", "medium", "sparse",
+    # forest
+    "forest", "forests", "woodland", "woods", "tree", "trees", "wooded",
+    # freeway / overpass / intersection
+    "freeway", "freeways", "highway", "highways", "expressway", "motorway", "interchange", "intersection", "crossroad", "junction",
+    # golfcourse
+    "golf", "golfcourse", "fairway", "fairways",
+    # harbor
+    "harbor", "harbors", "port", "ports", "dock", "docks", "pier", "piers", "wharf", "boat", "boats", "ship", "ships",
+    # overpass
+    "overpass", "flyover", "bridge",
+    # parkinglot
+    "parking", "parkinglot", "cars", "car", "vehicles", "vehicle", "parked",
+    # river
+    "river", "rivers", "stream", "streams", "waterway",
+    # runway
+    "runway", "runways", "airstrip", "taxiway", "airfield", "airport",
+    # storagetanks
+    "storage", "tank", "tanks", "silo", "silos", "cistern",
+    # tenniscourt
+    "tennis", "court", "courts"
+}
+
+def mask_caption(text):
+    """
+    方案一核心：清洗文本并对泄露类别标签的核心实体词进行 <MASK> 掩码替换
+    """
+    words = text.replace(",", " , ").replace(".", " . ").replace(";", " ; ").replace('"', " ").replace("'", " ").split()
+    masked_words = []
+    for w in words:
+        clean_w = w.lower().strip(".,;:\"'!?()[]{}")
+        if clean_w in LEAKY_KEYWORDS:
+            masked_words.append("<MASK>")
+        else:
+            masked_words.append(w)
+    return " ".join(masked_words)
+
+def build_vocab_from_texts(captions, vocab_size=2500):
+    vocab = {"<PAD>": 0, "<UNK>": 1, "<MASK>": 2}
     word_counts = {}
     for cap in captions:
-        words = cap.lower().replace(",", " ").replace(".", " ").replace(";", " ").split()
+        words = cap.lower().replace(",", " ").replace(".", " ").replace(";", " ").replace('"', " ").replace("'", " ").split()
         for w in words:
+            if w in vocab:
+                continue
             word_counts[w] = word_counts.get(w, 0) + 1
     sorted_words = sorted(word_counts.items(), key=lambda x: x[1], reverse=True)
     for w, _ in sorted_words:
@@ -23,223 +77,151 @@ def build_vocab_from_texts(captions, vocab_size=2000):
     return vocab
 
 def tokenize_caption(text, vocab, seq_len):
-    words = text.lower().replace(",", " ").replace(".", " ").replace(";", " ").split()
+    words = text.lower().replace(",", " ").replace(".", " ").replace(";", " ").replace('"', " ").replace("'", " ").split()
     tokens = [vocab.get(w, vocab["<UNK>"]) for w in words][:seq_len]
     if len(tokens) < seq_len:
         tokens = tokens + [vocab["<PAD>"]] * (seq_len - len(tokens))
     return torch.tensor(tokens, dtype=torch.long)
 
-def _read_and_resize(args):
-    idx, path, size = args
-    with Image.open(path) as img:
-        img_rgb = img.convert("RGB").resize((size, size), Image.Resampling.BILINEAR)
-        return idx, np.asarray(img_rgb, dtype=np.uint8)
+class UAVAERDataset(Dataset):
+    """
+    无人机应急侦察航拍数据集 (平铺结构: imgs/1.tif ~ 2100.tif，集成实体掩码保护)
+    """
+    CLASSES = [
+        "agricultural", "airplane", "baseballdiamond", "beach", "buildings",
+        "chaparral", "denseresidential", "forest", "freeway", "golfcourse",
+        "harbor", "intersection", "mediumresidential", "mobilehomepark",
+        "overpass", "parkinglot", "river", "runway", "sparseresidential",
+        "storagetanks", "tenniscourt"
+    ]
 
-class MultimodalFlowers102(Dataset):
-    def __init__(self, root="./data", train=True, transform=None, seq_len=24, vocab_size=2000):
-        if root.rstrip("/\\").endswith("flowers102"):
-            self.root = os.path.abspath(root)
-        else:
-            self.root = os.path.abspath(os.path.join(root, "flowers102"))
+    def __init__(self, root="./data/uav_aer", train=True, transform=None, seq_len=24, vocab_size=2500):
+        self.root = os.path.abspath(root)
         self.train = train
         self.transform = transform
         self.seq_len = seq_len
         self.vocab_size = vocab_size
-        self.num_classes = 102
+        self.num_classes = len(self.CLASSES)
+
         split_tag = "train" if train else "test"
-        cache_path = os.path.join(self.root, f"flowers102_{split_tag}_cache.npz")
-        if os.path.exists(cache_path):
-            cached = np.load(cache_path)
-            self.data = cached["data"]
+        # 更新缓存名，避免与旧版本未掩码的缓存产生冲突
+        self.cache_path = os.path.join(self.root, f"uav_aer_flat_masked_{split_tag}_cache.npz")
+
+        if os.path.exists(self.cache_path):
+            cached = np.load(self.cache_path)
+            self.images = cached["images"]
             self.targets = cached["targets"]
             self.tokens = torch.from_numpy(cached["tokens"])
         else:
-            self._build_from_local(split_tag, cache_path)
+            self._prepare_dataset(split_tag)
 
-    def _build_from_local(self, split_tag, cache_path):
-        labels_mat = os.path.join(self.root, "imagelabels.mat")
-        setid_mat = os.path.join(self.root, "setid.mat")
-        jpg_dir = os.path.join(self.root, "jpg")
+    def _locate_imgs_dir(self):
+        candidates = ["imgs", "Images", "images"]
+        for cand in candidates:
+            p = os.path.join(self.root, cand)
+            if os.path.exists(p) and os.path.isdir(p):
+                return p
+        raise FileNotFoundError(f"[Dataset 错误] 未在 {self.root} 下找到 imgs 图像目录！")
 
-        all_labels = scipy.io.loadmat(labels_mat)["labels"][0] - 1
-        setid = scipy.io.loadmat(setid_mat)
+    def _prepare_dataset(self, split_tag):
+        imgs_dir = self._locate_imgs_dir()
+        captions_path = os.path.join(self.root, "dataset.json")
 
-        if self.train:
-            split_indices = np.concatenate([setid["trnid"][0], setid["valid"][0]]) - 1
-        else:
-            split_indices = setid["tstid"][0] - 1
+        if not os.path.exists(captions_path):
+            raise FileNotFoundError(f"[Dataset 错误] 未找到标注文件: {captions_path}")
 
-        img_paths = [os.path.join(jpg_dir, f"image_{idx + 1:05d}.jpg") for idx in split_indices]
-        self.targets = np.array([all_labels[idx] for idx in split_indices], dtype=np.int64)
-        num_samples = len(img_paths)
+        print(f"[Dataset] 正在解析标注文件并应用关键词掩码: {captions_path}...")
+        with open(captions_path, 'r', encoding='utf-8') as f:
+            meta = json.load(f)
 
-        tasks = [(i, p, 64) for i, p in enumerate(img_paths)]
-        self.data = np.empty((num_samples, 64, 64, 3), dtype=np.uint8)
-        max_workers = min(32, (os.cpu_count() or 4) * 2)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for idx, arr in executor.map(_read_and_resize, tasks, chunksize=100):
-                self.data[idx] = arr
+        caption_map = {}
+        all_masked_captions = []
 
-        captions = self._generate_sample_descriptions(self.data)
-        self.vocab = build_vocab_from_texts(captions, vocab_size=self.vocab_size)
-        token_list = [tokenize_caption(c, self.vocab, self.seq_len) for c in captions]
-        self.tokens = torch.stack(token_list)
-        np.savez(cache_path, data=self.data, targets=self.targets, tokens=self.tokens.numpy())
+        images_list = meta.get("images", [])
+        for item in images_list:
+            fname = os.path.basename(item.get("filename", "")).lower()
+            sents = []
+            for s in item.get("sentences", []):
+                raw = s.get("raw", "").strip()
+                if raw:
+                    # 应用实体关键词掩码处理，切断文字捷径
+                    masked_sent = mask_caption(raw)
+                    sents.append(masked_sent)
+                    all_masked_captions.append(masked_sent)
+            if fname and sents:
+                caption_map[fname] = sents
 
-    def _generate_sample_descriptions(self, images_np):
-        imgs = images_np.astype(np.float32)
-        r = imgs[:, :, :, 0].mean(axis=(1, 2))
-        g = imgs[:, :, :, 1].mean(axis=(1, 2))
-        b = imgs[:, :, :, 2].mean(axis=(1, 2))
-        lum = 0.299 * r + 0.587 * g + 0.114 * b
-        captions = []
-        for i in range(len(imgs)):
-            r_val, g_val, b_val, l_val = r[i], g[i], b[i], lum[i]
-            if r_val > g_val + 15 and r_val > b_val + 15:
-                hue = "vivid scarlet crimson petals"
-            elif r_val > 140 and g_val > 140 and b_val < 100:
-                hue = "bright golden yellow blossoms"
-            elif b_val > r_val + 10 and b_val > g_val:
-                hue = "delicate violet lavender petals"
-            elif r_val > 130 and b_val > 130 and g_val < 110:
-                hue = "radiant magenta purple corolla"
-            elif l_val > 165:
-                hue = "pure creamy white floral petals"
+        print(f"[Dataset] 标注映射建立完毕 (已注入 <MASK> 保护)，匹配图像条目: {len(caption_map)}")
+
+        vocab = build_vocab_from_texts(all_masked_captions, vocab_size=self.vocab_size)
+
+        all_images = []
+        all_captions = []
+        all_labels = []
+
+        for class_idx in range(len(self.CLASSES)):
+            start_num = class_idx * 100 + 1
+            if self.train:
+                num_range = range(start_num, start_num + 80)
             else:
-                hue = "rich polychromatic multi-hued petals"
-            light = "sunlit outdoor clarity" if l_val > 130 else "soft diffused foliage shade"
-            captions.append(
-                f"botanical floral specimen displaying {hue} illuminated by {light} with centered flower head"
-            )
-        return captions
+                num_range = range(start_num + 80, start_num + 100)
 
-    def __len__(self):
-        return len(self.targets)
+            for img_num in num_range:
+                f_name = f"{img_num}.tif"
+                img_path = os.path.join(imgs_dir, f_name)
+                if not os.path.exists(img_path):
+                    alt_path = os.path.join(imgs_dir, f"{img_num}.TIF")
+                    if os.path.exists(alt_path):
+                        img_path = alt_path
+                    else:
+                        raise FileNotFoundError(f"[Dataset 错误] 缺失真实图像文件: {img_path}")
 
-    def __getitem__(self, idx):
-        img = Image.fromarray(self.data[idx])
-        if self.transform is not None:
-            img = self.transform(img)
-        return (img, self.tokens[idx]), int(self.targets[idx])
+                sents = caption_map.get(f_name.lower())
+                if not sents:
+                    raise RuntimeError(f"[Dataset 错误] 图像 {f_name} 在 dataset.json 中缺失标注文本！")
 
-class MultimodalCUB200(Dataset):
-    def __init__(self, root="./data", train=True, transform=None, seq_len=32, vocab_size=2500):
-        if root.rstrip("/\\").endswith("cub200"):
-            self.root = os.path.abspath(root)
-        else:
-            self.root = os.path.abspath(os.path.join(root, "cub200"))
-        self.train = train
-        self.transform = transform
-        self.seq_len = seq_len
-        self.vocab_size = vocab_size
-        self.num_classes = 200
-        split_tag = "train" if train else "test"
-        cache_path = os.path.join(self.root, f"cub200_{split_tag}_cache.npz")
-        if os.path.exists(cache_path):
-            cached = np.load(cache_path)
-            self.data = cached["data"]
-            self.targets = cached["targets"]
-            self.tokens = torch.from_numpy(cached["tokens"])
-        else:
-            self._build_and_cache(split_tag, cache_path)
+                try:
+                    with Image.open(img_path) as img:
+                        img_resized = img.convert("RGB").resize((64, 64), Image.Resampling.BILINEAR)
+                        all_images.append(np.asarray(img_resized, dtype=np.uint8))
+                        all_labels.append(class_idx)
+                        all_captions.append(sents[0])
+                except Exception as e:
+                    raise RuntimeError(f"[Dataset 错误] 图像文件损坏无法读取: {img_path}, 详情: {e}")
 
-    def _build_and_cache(self, split_tag, cache_path):
-        base_dir = os.path.join(self.root, "CUB_200_2011")
-        images_txt = os.path.join(base_dir, "images.txt")
-        labels_txt = os.path.join(base_dir, "image_class_labels.txt")
-        split_txt = os.path.join(base_dir, "train_test_split.txt")
-
-        id_to_path, id_to_label, is_train_id = {}, {}, {}
-        with open(images_txt, "r") as f:
-            for line in f:
-                p = line.strip().split()
-                if len(p) == 2:
-                    id_to_path[int(p[0])] = os.path.join(base_dir, "images", p[1])
-        with open(labels_txt, "r") as f:
-            for line in f:
-                p = line.strip().split()
-                if len(p) == 2:
-                    id_to_label[int(p[0])] = int(p[1]) - 1
-        with open(split_txt, "r") as f:
-            for line in f:
-                p = line.strip().split()
-                if len(p) == 2:
-                    is_train_id[int(p[0])] = (int(p[1]) == 1)
-
-        selected_ids = [img_id for img_id, is_tr in is_train_id.items() if is_tr == self.train]
-        selected_ids.sort()
-        img_paths = [id_to_path[i] for i in selected_ids]
-        self.targets = np.array([id_to_label[i] for i in selected_ids], dtype=np.int64)
-
-        attr_names_file = os.path.join(base_dir, "attributes", "attributes.txt")
-        attr_labels_file = os.path.join(base_dir, "attributes", "image_attribute_labels.txt")
-        attr_id_to_name = {}
-        if os.path.exists(attr_names_file):
-            with open(attr_names_file, "r") as f:
-                for line in f:
-                    p = line.strip().split()
-                    if len(p) >= 2:
-                        attr_id_to_name[int(p[0])] = p[1].replace("has_", "").replace("::", " ").replace("_", " ")
-
-        image_attrs = {img_id: [] for img_id in selected_ids}
-        if os.path.exists(attr_labels_file):
-            selected_set = set(selected_ids)
-            with open(attr_labels_file, "r") as f:
-                for line in f:
-                    p = line.strip().split()
-                    if len(p) >= 4:
-                        img_id = int(p[0])
-                        if img_id in selected_set and int(p[2]) == 1:
-                            name = attr_id_to_name.get(int(p[1]))
-                            if name:
-                                image_attrs[img_id].append(name)
-
-        captions = []
-        for img_id in selected_ids:
-            obs = image_attrs.get(img_id, [])
-            desc = "a fine-grained avian species characterized by " + ", and ".join(obs[:6]) if len(obs) >= 4 else \
-                   "a wild bird perched outdoors exhibiting distinct plumage markings and beak structure"
-            captions.append(desc)
-
-        num_samples = len(img_paths)
-        tasks = [(i, p, 64) for i, p in enumerate(img_paths)]
-        self.data = np.empty((num_samples, 64, 64, 3), dtype=np.uint8)
-        max_workers = min(32, (os.cpu_count() or 4) * 2)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for idx, arr in executor.map(_read_and_resize, tasks, chunksize=100):
-                self.data[idx] = arr
-
-        self.vocab = build_vocab_from_texts(captions, vocab_size=self.vocab_size)
-        token_list = [tokenize_caption(c, self.vocab, self.seq_len) for c in captions]
+        self.images = np.array(all_images, dtype=np.uint8)
+        self.targets = np.array(all_labels, dtype=np.int64)
+        token_list = [tokenize_caption(c, vocab, self.seq_len) for c in all_captions]
         self.tokens = torch.stack(token_list)
-        np.savez(cache_path, data=self.data, targets=self.targets, tokens=self.tokens.numpy())
+
+        np.savez(self.cache_path, images=self.images, targets=self.targets, tokens=self.tokens.numpy())
+        print(f"[Dataset] 掩码缓存已保存: {self.cache_path} ({split_tag} 样本数: {len(self.targets)}, 类别数: {self.num_classes})")
 
     def __len__(self):
         return len(self.targets)
 
     def __getitem__(self, idx):
-        img = Image.fromarray(self.data[idx])
+        img = Image.fromarray(self.images[idx])
         if self.transform is not None:
             img = self.transform(img)
         return (img, self.tokens[idx]), int(self.targets[idx])
 
 def split_data_dmfl(targets, num_sbs, clients_per_sbs, inner_client_iid, rng=None):
     if rng is None:
-        rng = np.random.default_rng()
+        rng = np.random.default_rng(42)
     num_users = num_sbs * clients_per_sbs
     u_per = clients_per_sbs
     labels = np.asarray(targets)
     idx = np.arange(len(labels))
     sorted_idx = idx[labels.argsort()]
 
-    # 1. 簇外严格 Non-IID: 每个 SBS 分配完全独立的类别分片
+    # 簇间严格 Non-IID
     shards = np.array_split(sorted_idx, num_sbs)
     user_map = {i: np.array([], dtype='int64') for i in range(num_users)}
 
     for eid in range(num_sbs):
         shard = shards[eid]
         total = len(shard)
-        # 2. 簇内 0.5 IID + 0.5 Non-IID
         n_iid = int(total * inner_client_iid)
         iid_pool = shard[:n_iid].copy()
         rng.shuffle(iid_pool)
@@ -258,11 +240,7 @@ def split_data_dmfl(targets, num_sbs, clients_per_sbs, inner_client_iid, rng=Non
 def get_dataloaders(config):
     seed = int(config.get("seed", 42))
     np_rng = np.random.default_rng(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
 
-    ds_name = config.get("dataset", "MultimodalFlowers102")
     train_transform = transforms.Compose([
         transforms.RandomCrop(64, padding=4),
         transforms.RandomHorizontalFlip(),
@@ -274,23 +252,21 @@ def get_dataloaders(config):
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
 
-    if ds_name == "MultimodalFlowers102":
-        seq_len = config.get("text_seq_len", 24)
-        vocab_size = config.get("text_vocab_size", 2000)
-        train_ds = MultimodalFlowers102(root="./data", train=True, transform=train_transform, seq_len=seq_len, vocab_size=vocab_size)
-        test_ds = MultimodalFlowers102(root="./data", train=False, transform=test_transform, seq_len=seq_len, vocab_size=vocab_size)
-        num_classes = 102
-    elif ds_name == "MultimodalCUB200":
-        seq_len = config.get("text_seq_len", 32)
-        vocab_size = config.get("text_vocab_size", 2500)
-        train_ds = MultimodalCUB200(root="./data", train=True, transform=train_transform, seq_len=seq_len, vocab_size=vocab_size)
-        test_ds = MultimodalCUB200(root="./data", train=False, transform=test_transform, seq_len=seq_len, vocab_size=vocab_size)
-        num_classes = 200
-    else:
-        raise ValueError(f"Unknown dataset: {ds_name}")
+    root_dir = config.get("data_dir", "./data/uav_aer")
+    train_ds = UAVAERDataset(
+        root=root_dir, train=True, transform=train_transform,
+        seq_len=config.get("text_seq_len", 24),
+        vocab_size=config.get("text_vocab_size", 2500)
+    )
+    test_ds = UAVAERDataset(
+        root=root_dir, train=False, transform=test_transform,
+        seq_len=config.get("text_seq_len", 24),
+        vocab_size=config.get("text_vocab_size", 2500)
+    )
+    num_classes = train_ds.num_classes
 
     targets = np.asarray(train_ds.targets)
-    inner_client_iid = config.get("inner_client_iid", 0.5)
+    inner_client_iid = config.get("inner_client_iid", 0.2)
     user_map = split_data_dmfl(
         targets,
         config["num_sbs"],
@@ -304,17 +280,20 @@ def get_dataloaders(config):
         "num_workers": config.get("num_workers", 0),
         "pin_memory": config.get("device") == "cuda",
     }
+
     for client_id in range(config["num_sbs"] * config["clients_per_sbs"]):
         indices = user_map[client_id]
         train_subset = Subset(train_ds, indices)
+        client_gen = torch.Generator()
+        client_gen.manual_seed(seed + client_id * 17)
         train_loader = DataLoader(
             train_subset, batch_size=config["batch_size"],
-            shuffle=True, **loader_kwargs
+            shuffle=True, generator=client_gen, **loader_kwargs
         )
         train_loaders.append(train_loader)
 
     test_loader = DataLoader(
-        test_ds, batch_size=config.get("eval_batch_size", 128),
+        test_ds, batch_size=config.get("eval_batch_size", 64),
         shuffle=False, **loader_kwargs
     )
     return train_loaders, test_loader, num_classes

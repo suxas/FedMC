@@ -1,11 +1,12 @@
 import copy
+import numpy as np
 from tqdm import tqdm
 from nodes.clients import ClientUE
 from nodes.models import FederatedModel
 from nodes.server import CloudServer
 from utils.dataset import get_dataloaders
 
-def run_fedavg(config, train_loaders=None, test_loader=None, num_classes=None, initial_state=None):
+def run_fedgc(config, train_loaders=None, test_loader=None, num_classes=None, initial_state=None):
     if train_loaders is None or test_loader is None:
         train_loaders, test_loader, num_classes = get_dataloaders(config)
 
@@ -20,9 +21,13 @@ def run_fedavg(config, train_loaders=None, test_loader=None, num_classes=None, i
     ]
     lbs = CloudServer(config)
     straggler_ratio = config.get('straggler_ratio', 0.5)
+    momentum_lambda = config.get('fedgc_momentum', 0.8)
+
+    total_params = sum(p.numel() for p in global_model.parameters())
+    client_grad_buffer = {c.id: None for c in clients}
 
     metric_loss, metric_top1, metric_top5, metric_f1 = [], [], [], []
-    pbar = tqdm(range(config['global_rounds']), colour='red', desc="[Multimodal FedAvg]")
+    pbar = tqdm(range(config['global_rounds']), colour='magenta', desc="[Multimodal FedGC]")
 
     for round_idx in pbar:
         edge_updates = []
@@ -35,21 +40,52 @@ def run_fedavg(config, train_loaders=None, test_loader=None, num_classes=None, i
             k = max(1, int(len(cluster_clients) * (1.0 - straggler_ratio))) - 1
             t_win = sorted(times)[k]
 
-            sbs_sum_grad = 0.0
-            sbs_samples = 0
+            active_grads = []
+            active_weights = []
+            straggler_clients = []
+
             for client, t in zip(cluster_clients, times):
-                # 严格遵守传统 FedAvg: 超时节点直接整机抛弃
                 if t <= t_win:
                     grad, _ = client.local_train(global_state_dict)
-                    sbs_sum_grad += grad * client.num_train_samples
-                    sbs_samples += client.num_train_samples
+                    active_grads.append(grad)
+                    active_weights.append(client.num_train_samples)
+                    client_grad_buffer[client.id] = grad.copy()
+                else:
+                    straggler_clients.append(client)
+
+            if len(active_grads) > 0:
+                mean_active_grad = np.average(active_grads, axis=0, weights=active_weights)
+            else:
+                mean_active_grad = np.zeros(total_params, dtype=np.float32)
+
+            sbs_grad_sum = np.zeros(total_params, dtype=np.float32)
+            sbs_samples = 0
+
+            for g, w in zip(active_grads, active_weights):
+                sbs_grad_sum += g * w
+                sbs_samples += w
+
+            # 一阶动量外推补偿掉队者梯度
+            for sc in straggler_clients:
+                hist_g = client_grad_buffer[sc.id]
+                if hist_g is not None:
+                    imputed_grad = hist_g + momentum_lambda * (mean_active_grad - hist_g)
+                else:
+                    imputed_grad = mean_active_grad.copy()
+
+                sbs_grad_sum += imputed_grad * sc.num_train_samples
+                sbs_samples += sc.num_train_samples
+
+                # 后台真实异步训练以更新其历史梯度
+                async_grad, _ = sc.local_train(global_state_dict)
+                client_grad_buffer[sc.id] = async_grad.copy()
 
             if sbs_samples > 0:
-                edge_updates.append((sbs_sum_grad, sbs_samples))
+                edge_updates.append((sbs_grad_sum, sbs_samples))
 
         if edge_updates:
-            total_samples = sum(s for _, s in edge_updates)
-            global_update = sum(g for g, _ in edge_updates) / max(total_samples, 1)
+            total_s = sum(s for _, s in edge_updates)
+            global_update = sum(g for g, _ in edge_updates) / max(total_s, 1)
             lbs.apply_update(global_state_dict, global_update, config['device'])
 
         eval_res = lbs.evaluate(global_state_dict, test_loader, global_model, config['device'])

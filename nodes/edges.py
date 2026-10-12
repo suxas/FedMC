@@ -2,7 +2,7 @@ import warnings
 import numpy as np
 
 class EdgeSBS:
-    """边缘小基站 (SBS) - 负责模态解耦 LRMC 重构与簇内聚合"""
+    """边缘小基站 (SBS) - 集成模态解耦残差 LRMC、模长校准与抗污染真余弦门控重构"""
     def __init__(self, sbs_id, config):
         self.id = sbs_id
         self.config = config
@@ -14,6 +14,8 @@ class EdgeSBS:
         self._vis_end_idx = None
         self._head_split_idx = None
         self._current_round = 0
+        self._last_global_state = None
+        self._current_round_gradients = {}
 
     def _inspect_layer_indices(self, global_state_dict):
         v_size, t_size, c_size = 0, 0, 0
@@ -29,8 +31,10 @@ class EdgeSBS:
                 c_size += n
         return v_size, v_size + t_size, v_size + t_size + c_size
 
-    def collect_gradients(self, clients, global_state_dict, round_idx=0):
+    def collect_gradients(self, clients, global_state_dict, round_idx=0, tau_override=None):
         self._current_round = round_idx
+        self._last_global_state = global_state_dict
+        self._current_round_gradients = {}
         gradients, straggler_ids, normal_ids = [], [], []
         self._row_client_ids = [c.id for c in clients]
 
@@ -42,68 +46,56 @@ class EdgeSBS:
 
         times = [c.simulate_communication_time(round_idx)[1] for c in clients]
         straggler_ratio = min(max(self.config.get("straggler_ratio", 0.5), 0.0), 1.0)
-        k = max(1, int(len(clients) * (1.0 - straggler_ratio))) - 1
-        t_win = sorted(times)[k]
+        if tau_override is not None:
+            t_win = tau_override
+        else:
+            k = max(1, int(len(clients) * (1.0 - straggler_ratio))) - 1
+            t_win = sorted(times)[k]
 
-        for client, t in zip(clients, times):
+        delta_matrix = np.full((len(clients), self.grad_dim), np.nan, dtype=np.float32)
+
+        for row, (client, t) in enumerate(zip(clients, times)):
             if t > t_win:
                 gradients.append(None)
                 straggler_ids.append(client.id)
                 continue
 
             grad, _ = client.local_train(global_state_dict)
-            grad = np.asarray(grad).reshape(-1)
+            grad = np.asarray(grad, dtype=np.float32).reshape(-1)
             gradients.append(grad)
             normal_ids.append(client.id)
+            self._current_round_gradients[client.id] = grad
 
-            history = self.gradient_buffer.setdefault(client.id, [])
-            history.append(grad.copy())
-            del history[:-self.buffer_size]
+            history = self.gradient_buffer.get(client.id)
+            if history and len(history) > 0:
+                delta_matrix[row] = grad - history[-1]
+            else:
+                delta_matrix[row] = grad.copy()
 
-        matrix = np.full((len(clients), self.grad_dim), np.nan, dtype=np.float32)
-        for row, grad in enumerate(gradients):
-            if grad is not None:
-                matrix[row] = grad
+        return delta_matrix, straggler_ids, normal_ids
 
-        # 异步更新机制：慢节点后台完成计算并缓存，供后续重构使用
-        for sid in straggler_ids:
-            target_client = next(c for c in clients if c.id == sid)
-            async_grad, _ = target_client.local_train(global_state_dict)
-            h = self.gradient_buffer.setdefault(sid, [])
-            h.append(np.asarray(async_grad).reshape(-1).copy())
-            del h[:-self.buffer_size]
-
-        return matrix, straggler_ids, normal_ids
-
-    def _lrmc_visual_block(self, visual_mat, round_idx=None):
-        """对视觉主干稠密卷积核执行严密的 SVD 低秩补全 (集成退火截断)"""
-        missing = np.isnan(visual_mat)
+    def _lrmc_visual_block(self, visual_delta_mat, round_idx=None):
+        missing = np.isnan(visual_delta_mat)
         if not missing.any():
-            return visual_mat.copy()
+            return visual_delta_mat.copy()
 
         observed_rows = np.flatnonzero(~missing.all(axis=1))
         if len(observed_rows) == 0:
-            return np.zeros_like(visual_mat)
+            return np.zeros_like(visual_delta_mat)
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
-            col_mean = np.nanmean(visual_mat, axis=0)
+            col_mean = np.nanmean(visual_delta_mat, axis=0)
         col_mean = np.nan_to_num(col_mean, nan=0.0)
-        filled = np.where(missing, col_mean, visual_mat)
-
-        # 优先使用掉队节点的历史视觉参数作为补全初始估计
-        for r_idx, cid in enumerate(self._row_client_ids):
-            if missing[r_idx].all() and cid in self.gradient_buffer and len(self.gradient_buffer[cid]) > 0:
-                filled[r_idx] = self.gradient_buffer[cid][-1][:visual_mat.shape[1]]
+        filled = np.where(missing, col_mean, visual_delta_mat)
 
         max_iter = self.config.get("lrmc_max_iter", 30)
         tol = self.config.get("lrmc_tol", 1e-4)
 
-        # 自适应平滑退火能量截断比: 前期过滤大尺度噪声，后期自适应抬升保留细粒度特征
         if round_idx is None:
             round_idx = self._current_round
-        total_rounds = max(1, self.config.get("global_rounds", 300))
-        rank_min = self.config.get("lrmc_rank_ratio_min", self.config.get("lrmc_rank_ratio", 0.80))
+        total_rounds = max(1, self.config.get("global_rounds", 500))
+        rank_min = self.config.get("lrmc_rank_ratio_min", 0.80)
         rank_max = self.config.get("lrmc_rank_ratio_max", 0.95)
         progress = min(max(round_idx / float(total_rounds), 0.0), 1.0)
         energy_ratio = rank_min + (rank_max - rank_min) * progress
@@ -134,67 +126,87 @@ class EdgeSBS:
 
         return np.nan_to_num(filled, nan=0.0)
 
-    def lrmc_complete(self, grad_matrix, round_idx=None):
-        matrix = np.asarray(grad_matrix, dtype=np.float32)
-        if matrix.size == 0 or not np.isnan(matrix).any():
-            return np.nan_to_num(matrix, nan=0.0)
+    def lrmc_complete(self, delta_matrix, round_idx=None):
+        delta_mat = np.asarray(delta_matrix, dtype=np.float32)
+        if delta_mat.size == 0:
+            return np.zeros((len(self._row_client_ids), self.grad_dim or 0), dtype=np.float32)
 
         if round_idx is None:
             round_idx = self._current_round
 
         v_end = self._vis_end_idx
 
-        # 1. 视觉卷积块: 执行带退火机制的高精度 LRMC
-        v_block = matrix[:, :v_end]
-        completed_visual = self._lrmc_visual_block(v_block, round_idx=round_idx)
+        # 1. 视觉主干残差增量执行退火 LRMC 补全
+        v_delta = delta_mat[:, :v_end]
+        completed_v_delta = self._lrmc_visual_block(v_delta, round_idx=round_idx)
 
-        # 2. 文本编码器与分类头: 弱相关与类别特异性，改用历史动量保护
-        rest_block = matrix[:, v_end:].copy()
-        rest_missing = np.isnan(rest_block)
-        if rest_missing.any():
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)
-                mean_rest = np.nanmean(rest_block, axis=0)
-            mean_rest = np.nan_to_num(mean_rest, nan=0.0)
-            rest_block = np.where(rest_missing, mean_rest, rest_block)
+        # 2. 文本与分类头：掉队行严格置零以锁定私有类别梯度
+        rest_delta = np.zeros((delta_mat.shape[0], delta_mat.shape[1] - v_end), dtype=np.float32)
+        for r_idx in range(delta_mat.shape[0]):
+            if not np.isnan(delta_mat[r_idx, v_end:]).any():
+                rest_delta[r_idx] = delta_mat[r_idx, v_end:]
 
-            for r_idx, cid in enumerate(self._row_client_ids):
-                if rest_missing[r_idx].any() and cid in self.gradient_buffer and len(self.gradient_buffer[cid]) > 0:
-                    rest_block[r_idx] = self.gradient_buffer[cid][-1][v_end:]
+        completed_delta = np.concatenate([completed_v_delta, rest_delta], axis=1)
 
-        return np.concatenate([completed_visual, rest_block], axis=1)
+        # 3. 模长自适应校准 (Energy Alignment)
+        observed_mask = ~np.isnan(delta_mat).any(axis=1)
+        if observed_mask.any():
+            active_norms = np.linalg.norm(completed_delta[observed_mask, :v_end], axis=1)
+            mean_target_norm = float(np.mean(active_norms))
+        else:
+            mean_target_norm = 1.0
 
-    def get_compensated_gradient(self, client_id, lrmc_gradient):
-        history = self.gradient_buffer.get(client_id)
-        if not history:
-            return lrmc_gradient
+        full_grad_matrix = np.empty((len(self._row_client_ids), self.grad_dim), dtype=np.float32)
 
-        n_hist = len(history)
-        decay = np.array([0.85 ** (n_hist - 1 - i) for i in range(n_hist)])
-        decay /= decay.sum()
-        historical = np.average(history, axis=0, weights=decay)
+        for row, cid in enumerate(self._row_client_ids):
+            if cid in self._current_round_gradients:
+                full_grad_matrix[row] = self._current_round_gradients[cid]
+            else:
+                cur_recon_norm = np.linalg.norm(completed_delta[row, :v_end])
+                if cur_recon_norm > 1e-8 and mean_target_norm > 1e-8:
+                    scale_factor = min(max(mean_target_norm / cur_recon_norm, 0.8), 1.6)
+                    completed_delta[row, :v_end] *= scale_factor
 
-        norm_l = np.linalg.norm(lrmc_gradient)
-        norm_h = np.linalg.norm(historical)
-        if norm_l > 0 and norm_h > 0:
-            cosine = float(np.dot(lrmc_gradient, historical) / (norm_l * norm_h + 1e-12))
-            confidence = max(0.0, cosine)
-            alpha = self.compensation_weight * (0.5 + 0.5 * confidence)
-            return alpha * lrmc_gradient + (1.0 - alpha) * historical
-        return historical if norm_h > 0 else lrmc_gradient
+                history = self.gradient_buffer.get(cid)
+                if history and len(history) > 0:
+                    hist_grad = history[-1]
+                    recon_grad = hist_grad + completed_delta[row]
+
+                    norm_r = np.linalg.norm(recon_grad)
+                    norm_h = np.linalg.norm(hist_grad)
+                    if norm_r > 0 and norm_h > 0:
+                        cos = float(np.dot(recon_grad, hist_grad) / (norm_r * norm_h + 1e-12))
+                        cos_c = max(-1.0, min(1.0, cos))
+                        alpha = self.compensation_weight * (0.5 + 0.5 * max(0.0, cos_c))
+                        full_grad_matrix[row] = alpha * recon_grad + (1.0 - alpha) * hist_grad
+                    else:
+                        full_grad_matrix[row] = recon_grad
+                else:
+                    full_grad_matrix[row] = completed_delta[row]
+
+        return np.nan_to_num(full_grad_matrix, nan=0.0)
 
     def intra_cluster_aggregate(self, grad_matrix, straggler_ids, clients):
         matrix = np.asarray(grad_matrix).copy()
         if matrix.size == 0:
             return np.zeros(self.grad_dim or 0, dtype=np.float32), 0
 
-        stragglers = set(straggler_ids)
-        for row, client in enumerate(clients):
-            if client.id in stragglers:
-                matrix[row] = self.get_compensated_gradient(client.id, matrix[row])
-
         sample_counts = np.array([c.num_train_samples for c in clients], dtype=np.float64)
         cluster_sum = np.sum(matrix * sample_counts[:, None], axis=0)
+
+        stragglers = set(straggler_ids)
+        for client in clients:
+            if client.id in stragglers:
+                async_grad, _ = client.local_train(self._last_global_state)
+                h = self.gradient_buffer.setdefault(client.id, [])
+                h.append(np.asarray(async_grad, dtype=np.float32).reshape(-1).copy())
+                del h[:-self.buffer_size]
+            else:
+                if client.id in self._current_round_gradients:
+                    h = self.gradient_buffer.setdefault(client.id, [])
+                    h.append(self._current_round_gradients[client.id].copy())
+                    del h[:-self.buffer_size]
+
         return np.nan_to_num(cluster_sum, nan=0.0), int(np.sum(sample_counts))
 
     def ota_to_lbs(self, aggregated_grad):

@@ -5,29 +5,27 @@ import torch.nn as nn
 from nodes.models import FederatedModel
 
 class ClientUE:
-    """UAV 边缘终端节点 (具备物理位置、信道衰落与计算建模)"""
+    """无人机边缘计算节点 (包含物理链路、机载主频与训练建模)"""
     def __init__(self, client_id, config, train_loader, test_loader, num_classes):
         self.id = client_id
         self.config = config
         self.device = config["device"]
         self.train_loader = train_loader
         self.test_loader = test_loader
-        self.model = FederatedModel(config.get("dataset", "MultimodalFlowers102"), num_classes).to(self.device)
+        self.model = FederatedModel(config.get("dataset", "UAV-AER"), num_classes).to(self.device)
         self.criterion = nn.CrossEntropyLoss()
 
-        # 方案 B: 物理属性在初始化时静态固定 (依托主种子生成)
         clients_per_sbs = config.get("clients_per_sbs", 10)
         intra_idx = self.id % clients_per_sbs
         ratio = intra_idx / max(1, clients_per_sbs - 1)
 
-        # 1. 静态几何距离: 100m 到 500m
+        # 巡检几何半径: 100米至500米
         self.distance = 100.0 + 400.0 * ratio
-        # 2. 静态计算主频: 1.0 GHz 到 2.5 GHz
+        # 机载主频: 1.0 GHz 至 2.5 GHz
         self.cpu_freq = 1.0e9 + 1.5e9 * (1.0 - ratio)
-        # 3. 基础发射功率与带宽
-        self.bandwidth = 1.0e6      # 1 MHz
-        self.tx_power = 0.2         # 200 mW
-        self.noise_power = 1e-13    # 噪声功率谱密度
+        self.bandwidth = 1.0e6
+        self.tx_power = 0.2
+        self.noise_power = 1e-13
 
     @property
     def num_train_samples(self):
@@ -45,27 +43,18 @@ class ClientUE:
         self.model.load_state_dict(global_state, strict=True)
 
     def simulate_communication_time(self, round_idx=0, drop_visual=False):
-        """
-        方案 B: 静态大尺度路径损耗 + 瞬时瑞利快衰落微扰
-        drop_visual=True 时计算量和上传参数量大幅削减
-        """
-        # 统一受控随机种子，保证跨算法在相同轮次下信道微扰严格一致
         rng = np.random.default_rng(self.config.get("seed", 42) + 1000003 * round_idx + 9176 * self.id)
         fast_fading = rng.exponential(scale=1.0)
 
-        # 路径损耗 PL = (c / (4*pi*f*d))^2
         path_loss = (3e8 / (4.0 * math.pi * 2.4e9 * self.distance)) ** 2
         h_channel = path_loss * fast_fading
         snr = (self.tx_power * h_channel) / self.noise_power
-        uplink_rate = max(self.bandwidth * math.log2(1.0 + snr), 5e4)  # bps
+        uplink_rate = max(self.bandwidth * math.log2(1.0 + snr), 5e4)
 
-        # 计算时延与传输时延
         cycles_per_sample = 150
         num_epochs = self.config.get("local_epochs", 4)
         if drop_visual:
-            # 切断视觉分支后算力消耗降低 80%
             t_cpu = (num_epochs * (cycles_per_sample * 0.2) * self.num_train_samples) / self.cpu_freq
-            # 仅传输文本和分类头参数
             param_count = sum(p.numel() for name, p in self.model.named_parameters() if 'visual' not in name)
         else:
             t_cpu = (num_epochs * cycles_per_sample * self.num_train_samples) / self.cpu_freq
@@ -110,7 +99,6 @@ class ClientUE:
                     head_split_idx = sum(u.size for u in updates)
                     head_found = True
                 if drop_visual and 'visual' in name:
-                    # 视觉分支未计算，更新量置零
                     updates.append(np.zeros(value.numel(), dtype=np.float32))
                 else:
                     diff = (value.float() - current[name].float()).cpu().numpy().ravel()

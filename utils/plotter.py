@@ -39,7 +39,7 @@ def plot_results(results_dict, save_path="result/multimodal_comparison.png",
     if lines is None:
         lines = ['-', '--', '-.', ':', '-', '--', '-.', ':']
 
-    palette = ['#d62728', '#9467bd', '#ff7f0e', '#bcbd22', '#2ca02c', '#1f77b4']
+    palette = ['#9467bd', '#ff7f0e', '#bcbd22', '#d62728', '#2ca02c']
     setup_plot_style(font_family=font_family, font_size=font_size)
 
     base_dir = "result"
@@ -58,28 +58,32 @@ def plot_results(results_dict, save_path="result/multimodal_comparison.png",
             "ylabel": "Top-1 Accuracy (%)",
             "title": "Top-1 Accuracy vs. Communication Rounds",
             "tag": "top1_accuracy",
-            "legend_loc": "lower right"
+            "legend_loc": "lower right",
+            "ylim_bottom": 0.0
         },
         {
             "keys": ["top5", "Top5"],
             "ylabel": "Top-5 Accuracy (%)",
             "title": "Top-5 Accuracy vs. Communication Rounds",
             "tag": "top5_accuracy",
-            "legend_loc": "lower right"
+            "legend_loc": "lower right",
+            "ylim_bottom": 0.0
         },
         {
             "keys": ["f1", "macro_f1", "F1"],
             "ylabel": "Macro-F1 Score (%)",
             "title": "Macro-F1 Score vs. Communication Rounds",
             "tag": "macro_f1",
-            "legend_loc": "lower right"
+            "legend_loc": "lower right",
+            "ylim_bottom": 0.0
         },
         {
             "keys": ["loss", "Loss"],
             "ylabel": "Test Loss",
             "title": "Test Loss vs. Communication Rounds",
             "tag": "test_loss",
-            "legend_loc": "upper right"
+            "legend_loc": "upper right",
+            "ylim_bottom": None
         }
     ]
 
@@ -95,6 +99,7 @@ def plot_results(results_dict, save_path="result/multimodal_comparison.png",
             continue
 
         fig, ax = plt.subplots(1, 1, figsize=(8.5, 6))
+        max_round = 1.0
 
         for i, (algo_name, data) in enumerate(results_dict.items()):
             metric_series = None
@@ -107,16 +112,15 @@ def plot_results(results_dict, save_path="result/multimodal_comparison.png",
 
             raw_y = np.asarray(metric_series, dtype=np.float64)
             rounds = np.asarray(data.get('rounds', list(range(1, len(raw_y) + 1))), dtype=np.float64)
+            if len(rounds) > 0:
+                max_round = max(max_round, float(np.max(rounds)))
+
             color = palette[i % len(palette)]
             markevery = max(1, len(rounds) // 12)
-
             smooth_y = smooth_curve(raw_y, factor=0.88)
 
-            # 1. 原始波动细线
             ax.plot(rounds, raw_y, color=color, alpha=0.22, linewidth=1.0, zorder=2)
-            # 2. 阴影区间
             ax.fill_between(rounds, raw_y, smooth_y, color=color, alpha=0.14, zorder=1)
-            # 3. EMA 平滑主体曲线
             ax.plot(
                 rounds, smooth_y,
                 label=algo_name,
@@ -133,6 +137,9 @@ def plot_results(results_dict, save_path="result/multimodal_comparison.png",
         ax.set_title(m_cfg["title"])
         ax.legend(loc=m_cfg["legend_loc"], framealpha=0.92, facecolor='white', edgecolor='none')
         ax.grid(True, linestyle='--', alpha=0.55)
+        ax.set_xlim(left=0, right=max_round)
+        if m_cfg.get("ylim_bottom") is not None:
+            ax.set_ylim(bottom=m_cfg["ylim_bottom"])
 
         file_prefix = f"{name_without_ext}_{m_cfg['tag']}"
         png_path = os.path.join(png_dir, f"{file_prefix}_{timestamp}.png")

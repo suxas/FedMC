@@ -68,7 +68,6 @@ def run_salf(config, train_loaders=None, test_loader=None, num_classes=None, ini
             client_timing = []
             for client in cluster_clients:
                 _, total_time = client.simulate_communication_time(round_idx)
-                # 计算真实有效信道带宽
                 rng = np.random.default_rng(config.get("seed", 42) + 1000003 * round_idx + 9176 * client.id)
                 fast_fading = rng.exponential(1.0)
                 path_loss = (3e8 / (4.0 * np.pi * 2.4e9 * client.distance)) ** 2
@@ -102,7 +101,6 @@ def run_salf(config, train_loaders=None, test_loader=None, num_classes=None, ini
                 if t_total <= t_win:
                     mask = np.ones(total_params, dtype=np.float32)
                 else:
-                    # 依据可用时间预算截断参数层
                     remaining_time = max(0.0, t_win - t_cpu)
                     available_bits = remaining_time * rate
                     mask = generate_best_effort_salf_mask(sorted_layers, total_params, available_bits)

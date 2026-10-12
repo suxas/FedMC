@@ -10,8 +10,6 @@ def get_modality_split_indices(global_state_dict):
     vis_count = 0
     tot_count = 0
     for name, tensor in global_state_dict.items():
-        if not tensor.is_floating_point():
-            continue
         n = tensor.numel()
         if 'visual' in name:
             vis_count += n
@@ -55,14 +53,12 @@ def run_moddrop_fed(config, train_loaders=None, test_loader=None, num_classes=No
             for client, t in zip(cluster_clients, times):
                 n_samples = client.num_train_samples
                 if t <= t_win:
-                    # 准时节点: 运行全双模态网络
                     grad, _ = client.local_train(global_state_dict, drop_visual=False)
                     mask = np.ones(total_params, dtype=np.float32)
                 else:
-                    # 掉队节点: 触发 Modality Dropout，特征填零只训练文本+分类头
                     grad, _ = client.local_train(global_state_dict, drop_visual=True)
                     mask = np.zeros(total_params, dtype=np.float32)
-                    mask[vis_split:] = 1.0  # 视觉部分权重为 0，不上传不更新
+                    mask[vis_split:] = 1.0
 
                 sbs_grad_sum += grad * n_samples
                 sbs_mask_weight += mask * n_samples

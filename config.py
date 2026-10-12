@@ -2,46 +2,58 @@ import torch
 
 def get_base_config():
     return {
-        # 数据集配置: "MultimodalFlowers102" 或 "MultimodalCUB200"
-        "dataset": "MultimodalFlowers102",
-        "num_classes": 102,               # Flowers102: 102 | CUB200: 200
-        "text_seq_len": 24,               # Flowers102: 24  | CUB200: 32
-        "text_vocab_size": 2000,          # Flowers102: 2000| CUB200: 2500
-        "global_rounds": 500,             # 全局通信轮次
-        "num_sbs": 3,                     # 边缘小基站数量
-        "clients_per_sbs": 10,            # 每个SBS下属UAV数量 (共30个设备)
-        "seed": 42,                       # 仿真主随机种子
+        # 数据集与任务配置
+        "dataset": "UAV-AER",
+        "num_classes": 21,
+        "text_seq_len": 24,
+        "text_vocab_size": 2500,
+        "global_rounds": 100,
+        "num_sbs": 3,
+        "clients_per_sbs": 10,
+        "seed": 42,
 
-        # 硬件与局部训练参数
+        # 数据集获取与校验
+        "auto_download": True,
+        "image_url": "http://weegee.vision.ucmerced.edu/datasets/UCMerced_LandUse.zip",
+        "captions_url": "https://raw.githubusercontent.com/BigData-KSU/UCMerced-LandUse-Captions/master/dataset.json",
+
+        # 硬件与本地训练超参数
         "device": "cuda" if torch.cuda.is_available() else "cpu",
-        "batch_size": 64,
-        "local_lr": 0.01,                 # 本地 SGD 学习率
-        "weight_decay": 1e-4,             # L2 正则项
-        "local_epochs": 4,                # 默认本地迭代轮数
+        "batch_size": 32,
+        "local_lr": 0.01,
+        "weight_decay": 1e-4,
+        "local_epochs": 4,
         "momentum": 0.9,
         "num_workers": 0,
 
-        # FedAT (异步分层联邦) 参数 (IEEE/ACM SC 2020)
-        "fedat_gamma": 0.5,              # 陈旧度衰减幂指数 alpha(tau) = (tau + 1)^(-gamma)
-        "fedat_tier_period": 2,          # 慢梯队跨轮更新周期 (每2轮完成并提交一次)
+        # FedAT 异步分层参数
+        "fedat_gamma": 0.5,
+        "fedat_tier_period": 4,
 
-        # 数据分布与掉队率控制
-        "inner_client_iid": 0.5,         # 簇内 0.5 IID + 0.5 Non-IID
-        "straggler_ratio": 0.5,          # 掉队设备比例 (50%)
+        # FedGC 前沿动量梯度补偿基准参数
+        "fedgc_momentum": 0.8,
 
-        # Proposed 算法参数
-        "compensation_weight": 0.75,     # 历史动量与 LRMC 融合权重
-        "buffer_size": 6,                # SBS 历史梯度滑动窗口大小
-        "lrmc_rank_ratio_min": 0.80,     # 训练前期能量截断比 (低秩去噪)
-        "lrmc_rank_ratio_max": 0.95,     # 训练后期能量截断比 (平滑退火，保留细粒度特征)
-        "lrmc_max_iter": 40,             # LRMC 最大迭代次数
+        # 数据拓扑与掉队设置
+        "inner_client_iid": 0.2,
+        "straggler_ratio": 0.5,
+
+        # Proposed 核心算法参数
+        "compensation_weight": 0.75,
+        "buffer_size": 6,
+        "lrmc_rank_ratio_min": 0.80,
+        "lrmc_rank_ratio_max": 0.95,
+        "lrmc_max_iter": 30,
         "lrmc_tol": 1e-4,
 
-        # OTA 空中计算信道参数 (显式开关解耦)
-        "enable_ota_noise": False,       # 是否注入无线物理信道白噪声
-        "ota_snr_db": 20.0,              # 开启加噪时的基准健康信噪比 (20.0 dB)
+        # 空中计算通信参数
+        "enable_ota_noise": False,
+        "ota_snr_db": 20.0,
 
-        # 评估配置
-        "eval_batch_size": 128,
+        # 李雅普诺夫在线时延优化控制参数
+        "lyapunov_compression_ratio": 0.78,
+        "lyapunov_v": 90.0,
+
+        # 模型验证评估配置
+        "eval_batch_size": 64,
         "use_cache": False,
     }
